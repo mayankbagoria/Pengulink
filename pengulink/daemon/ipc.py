@@ -25,6 +25,7 @@ from pengulink.core.exceptions import (
     PairingTimestampExpiredError,
     PenguLinkError,
 )
+from pengulink.plugins.clipboard.backend import ClipboardError, ClipboardUnavailableError
 
 logger = logging.getLogger("pengulink.daemon.ipc")
 
@@ -48,6 +49,7 @@ NOTIFICATION_NOT_FOUND = -32005
 DAEMON_NOT_READY = -32006
 OPERATION_TIMEOUT = -32007
 DAEMON_ALREADY_RUNNING = -32008
+CLIPBOARD_ERROR = -32009
 
 
 def resolve_socket_path(socket_path: Optional[Union[Path, str]] = None) -> Path:
@@ -305,17 +307,26 @@ class PenguLinkIPCServer:
             return self._format_error(req_id if has_id else None, INVALID_PARAMS, f"Invalid parameters: {exc}") if has_id else b""
         except (ValueError, TypeError) as exc:
             return self._format_error(req_id if has_id else None, INVALID_PARAMS, f"Invalid parameters: {exc}") if has_id else b""
+        except ClipboardUnavailableError as exc:
+            return self._format_error(req_id if has_id else None, INTERNAL_ERROR, str(exc)) if has_id else b""
+        except ClipboardError as exc:
+            return self._format_error(req_id if has_id else None, CLIPBOARD_ERROR, str(exc)) if has_id else b""
         except PenguLinkError as exc:
             msg = str(exc)
             if "not connected" in msg.lower():
                 code = DEVICE_NOT_CONNECTED
             elif "not found" in msg.lower():
                 code = DEVICE_NOT_FOUND
+            elif "clipboard" in msg.lower() or "backend" in msg.lower():
+                code = CLIPBOARD_ERROR
             else:
                 code = APPLICATION_ERROR
             return self._format_error(req_id if has_id else None, code, msg) if has_id else b""
         except Exception as exc:
-            logger.warning("Error executing IPC method '%s': %s", method, exc)
+            if method == "set_clipboard":
+                logger.warning("Error executing IPC method '%s': %s", method, type(exc).__name__)
+            else:
+                logger.warning("Error executing IPC method '%s': %s", method, exc)
             return self._format_error(req_id if has_id else None, APPLICATION_ERROR, str(exc)) if has_id else b""
 
     def _format_error(
@@ -507,6 +518,16 @@ class PenguLinkIPCClient:
         res = await self.call("request_connectivity_report", {"device_id": device_id})
         return dict(res) if isinstance(res, dict) else {}
 
+    async def get_clipboard(self) -> Dict[str, Any]:
+        """Fetch current clipboard content and metadata from the daemon."""
+        res = await self.call("get_clipboard")
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def set_clipboard(self, content: str) -> Dict[str, Any]:
+        """Update local clipboard and broadcast to connected peers."""
+        res = await self.call("set_clipboard", {"content": content})
+        return dict(res) if isinstance(res, dict) else {}
+
     async def get_logs(self, limit: int = 100, level: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch recent records from in-memory LogRingBuffer."""
         params: Dict[str, Any] = {"limit": limit}
@@ -546,6 +567,7 @@ __all__ = [
     "DAEMON_NOT_READY",
     "OPERATION_TIMEOUT",
     "DAEMON_ALREADY_RUNNING",
+    "CLIPBOARD_ERROR",
     "resolve_socket_path",
     "PenguLinkIPCServer",
     "PenguLinkIPCClient",

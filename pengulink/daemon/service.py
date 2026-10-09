@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import datetime
+import hashlib
 import logging
 import signal
 import threading
@@ -62,6 +63,14 @@ from pengulink.network.tcp import TCPConnection, TCPStreamManager
 from pengulink.network.udp import DiscoveredDevice, UDPDiscovery
 from pengulink.plugins.base import PluginRegistry
 from pengulink.plugins.battery import BatteryPlugin, DeviceBatteryState
+from pengulink.plugins.clipboard import (
+    MAX_CLIPBOARD_PACKET_BYTES,
+    ClipboardBackend,
+    ClipboardError,
+    ClipboardPlugin,
+    ClipboardUnavailableError,
+    redact_clipboard,
+)
 from pengulink.plugins.connectivity_report import ConnectivityReportPlugin
 from pengulink.plugins.notification import NotificationPlugin, StoredNotification
 from pengulink.plugins.ping import PingPlugin
@@ -69,6 +78,29 @@ from pengulink.storage.base import DeviceStore
 from pengulink.storage.json_store import JsonStorageBackend
 
 logger = logging.getLogger("pengulink.daemon.service")
+
+
+def safe_redact_clipboard(content: Any) -> str:
+    """Format clipboard content safely for logging without leaking sensitive data."""
+    if content is None:
+        return "[REDACTED, None]"
+    if not isinstance(content, str):
+        content = str(content)
+    char_len = len(content)
+    digest_prefix = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:8]
+    return f"[REDACTED, {char_len} chars, sha256:{digest_prefix}]"
+
+
+class ClipboardResult(dict):
+    """Result dictionary that also compares equal to string content for convenience."""
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, str):
+            return self.get("content", "") == other
+        return super().__eq__(other)
+
+    def __str__(self) -> str:
+        return self.get("content", "")
 
 
 def format_uptime(seconds: float) -> str:
@@ -129,6 +161,7 @@ class PenguLinkDaemon:
         self,
         config: Optional[Union[Config, PenguLinkConfig]] = None,
         socket_path: Optional[Union[Path, str]] = None,
+        clipboard_backend: Optional[ClipboardBackend] = None,
     ) -> None:
         if config is None:
             self.config = Config.load()
@@ -154,11 +187,18 @@ class PenguLinkDaemon:
         self.battery_plugin = BatteryPlugin(event_bus=self.event_bus)
         self.notification_plugin = NotificationPlugin(event_bus=self.event_bus)
         self.connectivity_plugin = ConnectivityReportPlugin(event_bus=self.event_bus)
+        self.clipboard_plugin = ClipboardPlugin(
+            event_bus=self.event_bus,
+            backend=clipboard_backend,
+            packet_sender=self._send_clipboard_packet,
+            capability_checker=self._check_device_clipboard_capability,
+        )
         self.plugin_registry = PluginRegistry(event_bus=self.event_bus)
         self.plugin_registry.register(self.ping_plugin)
         self.plugin_registry.register(self.battery_plugin)
         self.plugin_registry.register(self.notification_plugin)
         self.plugin_registry.register(self.connectivity_plugin)
+        self.plugin_registry.register(self.clipboard_plugin)
         if hasattr(self.config, "device"):
             self.config.device.incoming_capabilities = self.plugin_registry.get_all_incoming_capabilities()
             self.config.device.outgoing_capabilities = self.plugin_registry.get_all_outgoing_capabilities()
@@ -694,6 +734,8 @@ class PenguLinkDaemon:
                 await self.event_bus.publish(DeviceUnpaired(device_id=remote_id))
 
             self.connectivity_plugin.clear_device(remote_id)
+            if hasattr(self, "clipboard_plugin"):
+                self.clipboard_plugin.clear_device(remote_id)
             self._pairing_sessions.pop(remote_id, None)
             self._unpaired_peer_certs.pop(remote_id, None)
             await self._transition_device(remote_id, DeviceState.DISCONNECTED, reason="Peer revoked or rejected pairing")
@@ -863,6 +905,8 @@ class PenguLinkDaemon:
 
         await self.device_store.delete_device(device_id)
         self.connectivity_plugin.clear_device(device_id)
+        if hasattr(self, "clipboard_plugin"):
+            self.clipboard_plugin.clear_device(device_id)
         self._unpaired_peer_certs.pop(device_id, None)
         await self._transition_device(device_id, DeviceState.DISCONNECTED, reason="Device explicitly unpaired")
         await self.event_bus.publish(DeviceUnpaired(device_id=device_id))
@@ -927,6 +971,65 @@ class PenguLinkDaemon:
             "success": True,
             "message": "Connectivity report query transmitted",
         }
+
+    def _send_clipboard_packet(self, device_id: str, packet: Packet) -> None:
+        """Safe packet sender callback for ClipboardPlugin."""
+        try:
+            self.send_packet(device_id, packet)
+        except ConnectionClosedError:
+            pass
+
+    def _check_device_clipboard_capability(self, device_id: str, capability: str) -> bool:
+        """Check if remote peer advertises clipboard capability."""
+        dev = self._discovered_devices.get(device_id)
+        if not dev:
+            return True
+        return (
+            capability in dev.incoming_capabilities
+            or capability in dev.outgoing_capabilities
+        )
+
+    async def get_clipboard(self) -> Dict[str, Any]:
+        """Retrieve current clipboard text and metadata."""
+        if not hasattr(self, "clipboard_plugin") or not self.clipboard_plugin.is_running:
+            raise ClipboardUnavailableError("Clipboard plugin is not running or unavailable")
+        state = await self.clipboard_plugin.get_current_clipboard()
+        content = state.get("content", "")
+        if not content:
+            try:
+                fresh_text = await self.clipboard_plugin.backend.get_text()
+                if fresh_text:
+                    content = fresh_text
+            except Exception:
+                pass
+        encoded_bytes = len(content.encode("utf-8", errors="replace")) if content else 0
+        logger.debug("Retrieved clipboard text: %s", safe_redact_clipboard(content))
+        return ClipboardResult({
+            "content": content,
+            "timestamp": state.get("timestamp", 0),
+            "digest": state.get("digest"),
+            "bytes": encoded_bytes,
+        })
+
+    async def set_clipboard(self, content: str) -> bool:
+        """Set local clipboard content and broadcast to connected devices."""
+        if not hasattr(self, "clipboard_plugin") or not self.clipboard_plugin.is_running:
+            raise ClipboardUnavailableError("Clipboard plugin is not running or unavailable")
+        if not isinstance(content, str):
+            raise TypeError("Parameter 'content' must be a string")
+        try:
+            encoded = content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Clipboard content contains unencodable surrogate characters") from exc
+        if len(encoded) > MAX_CLIPBOARD_PACKET_BYTES:
+            raise ValueError(
+                f"Clipboard content exceeds maximum allowed size ({len(encoded)} > {MAX_CLIPBOARD_PACKET_BYTES} bytes)"
+            )
+        logger.info("Updating clipboard: %s", safe_redact_clipboard(content))
+        success = await self.clipboard_plugin.set_local_clipboard(content)
+        if not success:
+            raise ClipboardError("Failed to update clipboard backend")
+        return success
 
     # =====================================================================
     # JSON-RPC 2.0 Method Dispatcher
@@ -1156,6 +1259,23 @@ class PenguLinkDaemon:
                 raise ValueError("Parameter 'device_id' is required")
             return await self.request_connectivity_report(did)
 
+        elif method == "get_clipboard":
+            return await self.get_clipboard()
+
+        elif method == "set_clipboard":
+            if "content" not in params:
+                raise ValueError("Parameter 'content' is required")
+            content = params.get("content")
+            if not isinstance(content, str):
+                raise TypeError("Parameter 'content' must be a string")
+            await self.set_clipboard(content)
+            encoded = content.encode("utf-8", errors="replace")
+            return {
+                "status": "ok",
+                "bytes": len(encoded),
+                "timestamp": getattr(self.clipboard_plugin, "latest_timestamp", int(time.time() * 1000)),
+            }
+
         elif method == "get_logs":
             limit = int(params.get("limit", 100))
             level = params.get("level")
@@ -1193,6 +1313,8 @@ __all__ = [
     "format_uptime",
     "LogRingBuffer",
     "PenguLinkDaemon",
+    "safe_redact_clipboard",
+    "ClipboardResult",
 ]
 
 

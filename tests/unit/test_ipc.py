@@ -26,7 +26,9 @@ from pengulink.core.exceptions import (
 )
 from pengulink.daemon.ipc import (
     APPLICATION_ERROR,
+    CLIPBOARD_ERROR,
     DEVICE_NOT_FOUND,
+    INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
@@ -35,6 +37,7 @@ from pengulink.daemon.ipc import (
     PenguLinkIPCServer,
     resolve_socket_path,
 )
+from pengulink.plugins.clipboard.backend import ClipboardError, ClipboardUnavailableError
 
 
 @pytest.fixture
@@ -325,3 +328,84 @@ async def test_ipc_daemon_not_running_error(temp_socket_path: Path) -> None:
     client = PenguLinkIPCClient(socket_path=temp_socket_path)
     with pytest.raises(DaemonNotRunningError):
         await client.call("ping")
+
+
+# =====================================================================
+# Clipboard IPC Tests
+# =====================================================================
+
+async def test_ipc_clipboard_helpers(temp_socket_path: Path) -> None:
+    """Verify PenguLinkIPCClient get_clipboard and set_clipboard helper methods."""
+    captured: Dict[str, Any] = {}
+
+    async def mock_handler(method: str, params: Dict[str, Any]) -> Any:
+        if method == "get_clipboard":
+            return {"content": "Stored clip", "timestamp": 123456789, "bytes": 11}
+        elif method == "set_clipboard":
+            captured["content"] = params.get("content")
+            return {"status": "ok", "bytes": len(params.get("content", "").encode("utf-8"))}
+        raise KeyError(method)
+
+    server = PenguLinkIPCServer(socket_path=temp_socket_path, handler=mock_handler)
+    client = PenguLinkIPCClient(socket_path=temp_socket_path)
+    await server.start()
+    try:
+        get_res = await client.get_clipboard()
+        assert get_res["content"] == "Stored clip"
+        assert get_res["timestamp"] == 123456789
+
+        set_res = await client.set_clipboard("New remote text")
+        assert set_res["status"] == "ok"
+        assert captured["content"] == "New remote text"
+    finally:
+        await server.stop()
+
+
+async def test_ipc_clipboard_error_mappings(temp_socket_path: Path) -> None:
+    """Verify ClipboardError maps to CLIPBOARD_ERROR and ClipboardUnavailableError maps to INTERNAL_ERROR."""
+    async def mock_handler(method: str, params: Dict[str, Any]) -> Any:
+        if method == "fail_backend":
+            raise ClipboardError("Backend execution failure")
+        elif method == "fail_unavailable":
+            raise ClipboardUnavailableError("Clipboard plugin not active")
+        raise KeyError(method)
+
+    server = PenguLinkIPCServer(socket_path=temp_socket_path, handler=mock_handler)
+    client = PenguLinkIPCClient(socket_path=temp_socket_path)
+    await server.start()
+    try:
+        with pytest.raises(IPCError) as exc_info:
+            await client.call("fail_backend")
+        assert f"[{CLIPBOARD_ERROR}]" in str(exc_info.value)
+
+        with pytest.raises(IPCError) as exc_info:
+            await client.call("fail_unavailable")
+        assert f"[{INTERNAL_ERROR}]" in str(exc_info.value)
+    finally:
+        await server.stop()
+
+
+async def test_ipc_set_clipboard_sanitized_exception_logging(
+    temp_socket_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Verify exception logging during set_clipboard does not leak sensitive content."""
+    secret = "SUPER_SECRET_CANARY_TOKEN_9999"
+
+    async def mock_handler(method: str, params: Dict[str, Any]) -> Any:
+        if method == "set_clipboard":
+            raise RuntimeError(f"Crashing with secret {secret}")
+        return "ok"
+
+    server = PenguLinkIPCServer(socket_path=temp_socket_path, handler=mock_handler)
+    client = PenguLinkIPCClient(socket_path=temp_socket_path)
+    await server.start()
+    try:
+        with caplog.at_level("WARNING"):
+            with pytest.raises(IPCError):
+                await client.set_clipboard(secret)
+
+        # Assert the exception type was logged but not the secret value
+        assert secret not in caplog.text
+        assert "RuntimeError" in caplog.text
+    finally:
+        await server.stop()

@@ -53,6 +53,8 @@ ALL_CLI_SUBCOMMANDS = [
     ["reply", "remote_dev_1", "reply_token_1", "Hello!"],
     ["daemon", "status"],
     ["logs"],
+    ["clipboard", "get"],
+    ["clipboard", "set", "sample"],
 ]
 
 

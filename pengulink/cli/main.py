@@ -673,6 +673,97 @@ def daemon_status(ctx: click.Context) -> None:
 
 
 # =====================================================================
+# Clipboard Management Commands
+# =====================================================================
+
+@cli.group(name="clipboard", help="Inspect and synchronize system clipboard with connected devices.")
+def clipboard() -> None:
+    """Clipboard synchronization management."""
+    pass
+
+
+@clipboard.command(name="get", help="Retrieve current clipboard text.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.option("--raw", "-r", is_flag=True, default=False, help="Output raw text without panel formatting.")
+@click.pass_context
+def clipboard_get(ctx: click.Context, json_flag: bool, raw: bool) -> None:
+    """Output current clipboard text or JSON representation."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    result = run_ipc_call(ctx, "get_clipboard", {})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    content = result.get("content", "") if isinstance(result, dict) else ""
+    if not content and not raw:
+        console.print("[dim]Clipboard is empty.[/]")
+        return
+
+    # If piped/redirected or --raw requested, output exact unadorned text
+    if raw or not sys.stdout.isatty():
+        click.echo(content, nl=False)
+        return
+
+    # Rich panel presentation for interactive terminal
+    ts = result.get("timestamp") if isinstance(result, dict) else None
+    time_info = ""
+    if ts and ts > 0:
+        elapsed = max(0, int(time.time() - (ts / 1000.0)))
+        time_info = f"Updated: {elapsed}s ago"
+
+    chars_info = f"{len(content)} chars"
+    subtitle = f"{time_info} ({chars_info})" if time_info else chars_info
+
+    console.print(
+        Panel(
+            content,
+            title="[bold cyan]Clipboard Content[/]",
+            subtitle=subtitle,
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+
+
+@clipboard.command(name="set", help="Update clipboard locally and broadcast to connected peers.")
+@click.argument("text", type=str, required=False, default=None)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def clipboard_set(ctx: click.Context, text: Optional[str], json_flag: bool) -> None:
+    """Update clipboard locally and broadcast to connected devices."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+
+    # Support reading from stdin if text omitted or '-'
+    if text is None or text == "-":
+        if not sys.stdin.isatty():
+            stdin_content = sys.stdin.read()
+            if text is None and not stdin_content:
+                raise click.UsageError("Missing argument 'TEXT' or piped stdin.")
+            text = stdin_content
+        elif text is None:
+            raise click.UsageError("Missing argument 'TEXT' or piped stdin.")
+
+    # Validate payload size (<= 120 KB = 120,000 bytes)
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) > 120_000:
+        raise click.ClickException(
+            f"Clipboard content exceeds maximum allowed size ({len(encoded):,} bytes > 120,000 bytes)"
+        )
+
+    result = run_ipc_call(ctx, "set_clipboard", {"content": text})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    byte_count = result.get("bytes", len(encoded)) if isinstance(result, dict) else len(encoded)
+    console.print(
+        f"[bold green]✓ Clipboard updated ({byte_count} bytes) and broadcast to connected devices.[/]"
+    )
+
+
+# =====================================================================
 # Logs Command
 # =====================================================================
 

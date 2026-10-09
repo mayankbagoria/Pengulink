@@ -336,3 +336,132 @@ def test_cli_defensive_none_handling(cli_runner: CliRunner, tmp_path: Path) -> N
         assert result.exit_code == 0
         assert "Active Mobile Notifications" in result.output
         assert "notif_none_id" in result.output
+
+
+# =====================================================================
+# Clipboard CLI Tests
+# =====================================================================
+
+def test_cli_clipboard_get_interactive(cli_runner: CliRunner, tmp_path: Path) -> None:
+    """Verify clipboard get displays Rich panel in interactive mode."""
+    mock_socket = tmp_path / "daemon.sock"
+    mock_socket.touch()
+
+    sample_result = {
+        "content": "Secret text here",
+        "timestamp": 1728456789000,
+        "digest": "abcdef123456",
+        "bytes": 16,
+    }
+
+    with patch("pengulink.daemon.ipc.PenguLinkIPCClient.call_sync", return_value=sample_result):
+        result = cli_runner.invoke(cli, ["-s", str(mock_socket), "clipboard", "get"])
+        assert result.exit_code == 0
+        assert "Secret text here" in result.output
+
+
+def test_cli_clipboard_get_raw(cli_runner: CliRunner, tmp_path: Path) -> None:
+    """Verify clipboard get --raw prints unadorned text without decorations."""
+    mock_socket = tmp_path / "daemon.sock"
+    mock_socket.touch()
+
+    sample_result = {"content": "Exact raw clipboard text", "bytes": 24}
+
+    with patch("pengulink.daemon.ipc.PenguLinkIPCClient.call_sync", return_value=sample_result):
+        result = cli_runner.invoke(cli, ["-s", str(mock_socket), "clipboard", "get", "--raw"])
+        assert result.exit_code == 0
+        assert result.output == "Exact raw clipboard text"
+
+
+def test_cli_clipboard_get_json(cli_runner: CliRunner, tmp_path: Path) -> None:
+    """Verify clipboard get --json outputs machine-readable JSON."""
+    mock_socket = tmp_path / "daemon.sock"
+    mock_socket.touch()
+
+    sample_result = {"content": "JSON clipboard text", "timestamp": 1000, "bytes": 19}
+
+    with patch("pengulink.daemon.ipc.PenguLinkIPCClient.call_sync", return_value=sample_result):
+        result = cli_runner.invoke(cli, ["-s", str(mock_socket), "clipboard", "get", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["content"] == "JSON clipboard text"
+        assert data["bytes"] == 19
+
+
+def test_cli_clipboard_get_empty(cli_runner: CliRunner, tmp_path: Path) -> None:
+    """Verify clipboard get displays message when clipboard is empty."""
+    mock_socket = tmp_path / "daemon.sock"
+    mock_socket.touch()
+
+    sample_result = {"content": "", "timestamp": 0, "bytes": 0}
+
+    with patch("pengulink.daemon.ipc.PenguLinkIPCClient.call_sync", return_value=sample_result):
+        result = cli_runner.invoke(cli, ["-s", str(mock_socket), "clipboard", "get"])
+        assert result.exit_code == 0
+        assert "Clipboard is empty." in result.output
+
+
+def test_cli_clipboard_set_success(cli_runner: CliRunner, tmp_path: Path) -> None:
+    """Verify clipboard set updates clipboard and outputs confirmation without echoing raw text."""
+    mock_socket = tmp_path / "daemon.sock"
+    mock_socket.touch()
+
+    called_args: Dict[str, Any] = {}
+
+    def mock_call(method: str, params: Any = None, timeout: float = 10.0) -> Any:
+        called_args["method"] = method
+        called_args["params"] = params
+        return {"status": "ok", "bytes": len(params["content"].encode("utf-8")), "timestamp": 12345}
+
+    with patch("pengulink.daemon.ipc.PenguLinkIPCClient.call_sync", side_effect=mock_call):
+        result = cli_runner.invoke(cli, ["-s", str(mock_socket), "clipboard", "set", "My Private Secret"])
+        assert result.exit_code == 0
+        assert called_args["method"] == "set_clipboard"
+        assert called_args["params"]["content"] == "My Private Secret"
+        # Zero-logging privacy verification: confirmation message must not echo the raw content
+        assert "My Private Secret" not in result.output
+        assert "Clipboard updated (17 bytes)" in result.output
+
+
+def test_cli_clipboard_set_json(cli_runner: CliRunner, tmp_path: Path) -> None:
+    """Verify clipboard set --json outputs JSON result."""
+    mock_socket = tmp_path / "daemon.sock"
+    mock_socket.touch()
+
+    with patch("pengulink.daemon.ipc.PenguLinkIPCClient.call_sync", return_value={"status": "ok", "bytes": 5}):
+        result = cli_runner.invoke(cli, ["-s", str(mock_socket), "clipboard", "set", "hello", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["status"] == "ok"
+
+
+def test_cli_clipboard_set_piped_stdin(cli_runner: CliRunner, tmp_path: Path) -> None:
+    """Verify clipboard set reads from stdin when text is '-' or piped."""
+    mock_socket = tmp_path / "daemon.sock"
+    mock_socket.touch()
+
+    called_args: Dict[str, Any] = {}
+
+    def mock_call(method: str, params: Any = None, timeout: float = 10.0) -> Any:
+        called_args["params"] = params
+        return {"status": "ok", "bytes": len(params["content"].encode("utf-8"))}
+
+    with patch("pengulink.daemon.ipc.PenguLinkIPCClient.call_sync", side_effect=mock_call):
+        result = cli_runner.invoke(
+            cli,
+            ["-s", str(mock_socket), "clipboard", "set", "-"],
+            input="Piped Stdin Content",
+        )
+        assert result.exit_code == 0
+        assert called_args["params"]["content"] == "Piped Stdin Content"
+
+
+def test_cli_clipboard_set_oversized_validation(cli_runner: CliRunner, tmp_path: Path) -> None:
+    """Verify clipboard set rejects oversized text (> 120 KB)."""
+    mock_socket = tmp_path / "daemon.sock"
+    mock_socket.touch()
+
+    oversized = "X" * 125_000
+    result = cli_runner.invoke(cli, ["-s", str(mock_socket), "clipboard", "set", oversized])
+    assert result.exit_code != 0
+    assert "exceeds maximum allowed size" in result.output

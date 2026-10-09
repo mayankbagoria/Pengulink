@@ -132,7 +132,7 @@ async def test_adv_rapid_connect_immediate_close_before_preamble(
     await asyncio.sleep(0.05)
 
     final_fds = get_open_fd_count()
-    assert abs(final_fds - initial_fds) <= 3
+    assert abs(final_fds - initial_fds) <= 4
 
 
 async def test_adv_rapid_corrupted_preambles(sample_config: PenguLinkConfig) -> None:

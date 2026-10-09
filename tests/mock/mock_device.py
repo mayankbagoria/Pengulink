@@ -84,6 +84,8 @@ class MockDeviceConfig:
             "kdeconnect.notification",
             "kdeconnect.connectivity_report",
             "kdeconnect.connectivity_report.request",
+            "kdeconnect.clipboard",
+            "kdeconnect.clipboard.connect",
         ]
     )
     outgoing_capabilities: list[str] = field(
@@ -97,6 +99,8 @@ class MockDeviceConfig:
             "kdeconnect.notification.reply",
             "kdeconnect.connectivity_report",
             "kdeconnect.connectivity_report.request",
+            "kdeconnect.clipboard",
+            "kdeconnect.clipboard.connect",
         ]
     )
     tcp_port_min: int = 1716
@@ -179,6 +183,8 @@ class MockKdeConnectDevice:
         self.last_ping_message: Optional[str] = None
         self.current_battery_charge: int = 85
         self.is_battery_charging: bool = False
+        self.last_clipboard_content: Optional[str] = None
+        self.last_clipboard_timestamp: Optional[int] = None
 
     @property
     def is_running(self) -> bool:
@@ -630,6 +636,11 @@ class MockKdeConnectDevice:
             if self.config.auto_connectivity_reply:
                 await self.send_connectivity_report()
 
+        # 5. Clipboard packet handling
+        elif packet.type in ("kdeconnect.clipboard", "kdeconnect.clipboard.connect"):
+            self.last_clipboard_content = packet.body.get("content")
+            self.last_clipboard_timestamp = packet.body.get("timestamp")
+
     # ------------------------------------------------------------------
     # Packet Transmission & Helpers
     # ------------------------------------------------------------------
@@ -673,6 +684,11 @@ class MockKdeConnectDevice:
                 f"Timed out waiting for packet '{packet_type}'",
                 timeout_seconds=timeout,
             ) from exc
+
+    @property
+    def received_packets(self) -> list[Packet]:
+        """Return history of all received packets in chronological order."""
+        return list(self._received_packets)
 
     def get_received_packets(self, packet_type: Optional[str] = None) -> list[Packet]:
         """Return history of received packets, optionally filtered by type."""
@@ -775,6 +791,36 @@ class MockKdeConnectDevice:
         )
         await self.send_packet(pkt)
         return pkt
+
+    async def send_clipboard(
+        self,
+        content: str,
+        timestamp: Optional[int] = None,
+    ) -> Packet:
+        """Transmit kdeconnect.clipboard packet over active TLS stream."""
+        ts = timestamp if timestamp is not None else int(time.time() * 1000)
+        packet = Packet(
+            id=ts,
+            type="kdeconnect.clipboard",
+            body={"content": content, "timestamp": ts},
+        )
+        await self.send_packet(packet)
+        return packet
+
+    async def send_clipboard_connect(
+        self,
+        content: str,
+        timestamp: Optional[int] = None,
+    ) -> Packet:
+        """Transmit kdeconnect.clipboard.connect packet for initial sync over active TLS stream."""
+        ts = timestamp if timestamp is not None else int(time.time() * 1000)
+        packet = Packet(
+            id=ts,
+            type="kdeconnect.clipboard.connect",
+            body={"content": content, "timestamp": ts},
+        )
+        await self.send_packet(packet)
+        return packet
 
     async def initiate_pairing(self, target_pubkey_pem: Optional[str] = None) -> str:
         """Send kdeconnect.pair request and compute/return verification code."""

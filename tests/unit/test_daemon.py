@@ -370,3 +370,156 @@ async def test_daemon_pair_device_outbound(test_daemon_config: PenguLinkConfig, 
         await mock.stop()
         await daemon.stop()
 
+
+# =====================================================================
+# Clipboard Plugin Integration Tests
+# =====================================================================
+
+def test_daemon_clipboard_plugin_registered(test_daemon_config: PenguLinkConfig, tmp_path: Path) -> None:
+    """Verify ClipboardPlugin is registered in daemon and advertises capabilities."""
+    from pengulink.plugins.clipboard import InMemoryClipboardBackend
+
+    backend = InMemoryClipboardBackend()
+    daemon = PenguLinkDaemon(
+        config=test_daemon_config,
+        socket_path=tmp_path / "run" / "daemon.sock",
+        clipboard_backend=backend,
+    )
+    assert hasattr(daemon, "clipboard_plugin")
+    assert daemon.clipboard_plugin.backend is backend
+    assert daemon.plugin_registry.get_plugin("clipboard") is daemon.clipboard_plugin
+    incoming = daemon.plugin_registry.get_all_incoming_capabilities()
+    outgoing = daemon.plugin_registry.get_all_outgoing_capabilities()
+    assert "kdeconnect.clipboard" in incoming
+    assert "kdeconnect.clipboard.connect" in incoming
+    assert "kdeconnect.clipboard" in outgoing
+    assert "kdeconnect.clipboard.connect" in outgoing
+
+
+async def test_daemon_clipboard_lifecycle(test_daemon_config: PenguLinkConfig, tmp_path: Path) -> None:
+    """Verify ClipboardPlugin watcher starts and stops with daemon lifecycle."""
+    from pengulink.plugins.clipboard import InMemoryClipboardBackend
+
+    backend = InMemoryClipboardBackend()
+    daemon = PenguLinkDaemon(
+        config=test_daemon_config,
+        socket_path=tmp_path / "run" / "daemon.sock",
+        clipboard_backend=backend,
+    )
+    assert not daemon.clipboard_plugin.is_running
+
+    await daemon.start()
+    try:
+        assert daemon.clipboard_plugin.is_running
+    finally:
+        await daemon.stop()
+
+    assert not daemon.clipboard_plugin.is_running
+
+
+async def test_daemon_get_and_set_clipboard(test_daemon_config: PenguLinkConfig, tmp_path: Path) -> None:
+    """Verify daemon get_clipboard and set_clipboard methods."""
+    from pengulink.plugins.clipboard import InMemoryClipboardBackend
+
+    backend = InMemoryClipboardBackend()
+    daemon = PenguLinkDaemon(
+        config=test_daemon_config,
+        socket_path=tmp_path / "run" / "daemon.sock",
+        clipboard_backend=backend,
+    )
+    await daemon.start()
+    try:
+        initial = await daemon.get_clipboard()
+        assert initial.get("content") == "" or initial == ""
+
+        ok = await daemon.set_clipboard("Hello PenguLink Clipboard!")
+        assert ok is True
+
+        updated = await daemon.get_clipboard()
+        assert updated.get("content") == "Hello PenguLink Clipboard!"
+        assert updated == "Hello PenguLink Clipboard!"
+        assert updated.get("bytes") == len("Hello PenguLink Clipboard!".encode("utf-8"))
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_set_clipboard_validation(test_daemon_config: PenguLinkConfig, tmp_path: Path) -> None:
+    """Verify daemon set_clipboard validates input types and size limits."""
+    from pengulink.plugins.clipboard import InMemoryClipboardBackend
+
+    backend = InMemoryClipboardBackend()
+    daemon = PenguLinkDaemon(
+        config=test_daemon_config,
+        socket_path=tmp_path / "run" / "daemon.sock",
+        clipboard_backend=backend,
+    )
+    await daemon.start()
+    try:
+        with pytest.raises(TypeError):
+            await daemon.set_clipboard(12345)  # type: ignore
+
+        with pytest.raises(TypeError):
+            await daemon.set_clipboard(None)  # type: ignore
+
+        # Payload exceeding 120 KB limit
+        oversized = "A" * 125_000
+        with pytest.raises(ValueError, match="exceeds maximum allowed size"):
+            await daemon.set_clipboard(oversized)
+
+        # Unencodable surrogate
+        with pytest.raises(ValueError, match="surrogate characters"):
+            await daemon.set_clipboard("bad_\ud800_surrogate")
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_unpair_clears_clipboard_device(test_daemon_config: PenguLinkConfig, tmp_path: Path) -> None:
+    """Verify unpair_device purges device state from clipboard plugin."""
+    from pengulink.core.events import DeviceConnected
+    from pengulink.plugins.clipboard import InMemoryClipboardBackend
+
+    backend = InMemoryClipboardBackend()
+    daemon = PenguLinkDaemon(
+        config=test_daemon_config,
+        socket_path=tmp_path / "run" / "daemon.sock",
+        clipboard_backend=backend,
+    )
+    await daemon.start()
+    try:
+        test_dev = "peer_clipboard_test_device"
+        await daemon.event_bus.publish(DeviceConnected(device_id=test_dev))
+        await asyncio.sleep(0.05)
+        assert test_dev in daemon.clipboard_plugin.get_connected_devices()
+
+        await daemon.unpair_device(test_dev)
+        assert test_dev not in daemon.clipboard_plugin.get_connected_devices()
+    finally:
+        await daemon.stop()
+
+
+async def test_daemon_ipc_clipboard_roundtrip(test_daemon_config: PenguLinkConfig, tmp_path: Path) -> None:
+    """Verify IPC get_clipboard and set_clipboard over Unix domain socket."""
+    from pengulink.plugins.clipboard import InMemoryClipboardBackend
+
+    backend = InMemoryClipboardBackend()
+    sock_path = tmp_path / "run" / "daemon.sock"
+    daemon = PenguLinkDaemon(
+        config=test_daemon_config,
+        socket_path=sock_path,
+        clipboard_backend=backend,
+    )
+    await daemon.start()
+    try:
+        client = PenguLinkIPCClient(socket_path=sock_path)
+
+        set_res = await client.set_clipboard("IPC Synchronized Text")
+        assert set_res.get("status") == "ok"
+        assert set_res.get("bytes") == len("IPC Synchronized Text".encode("utf-8"))
+
+        get_res = await client.get_clipboard()
+        assert get_res.get("content") == "IPC Synchronized Text"
+        assert get_res.get("bytes") == len("IPC Synchronized Text".encode("utf-8"))
+        assert "timestamp" in get_res
+    finally:
+        await daemon.stop()
+

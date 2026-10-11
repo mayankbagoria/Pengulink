@@ -819,5 +819,244 @@ def logs(ctx: click.Context, limit: int, level: Optional[str]) -> None:
     console.print(table)
 
 
+# =====================================================================
+# Find My Phone Command
+# =====================================================================
+
+@cli.command(name="find-phone", help="Trigger high-priority ring on a connected Android device.")
+@click.argument("device_id", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def find_phone(ctx: click.Context, device_id: str, json_flag: bool) -> None:
+    """Send a locate alert packet to a connected peer device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    result = run_ipc_call(ctx, "find_phone", {"device_id": device_id})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    console.print(
+        Panel(
+            f"[bold]Locate request transmitted to device:[/] [bold cyan]{device_id}[/]\n\n"
+            "[green]✓ The remote device is ringing with high-priority alarm sound.[/]\n"
+            "[dim]Note: Repeat the command to toggle/cancel if supported by peer.[/]",
+            title="[bold yellow]🔔 Find My Phone[/]",
+            border_style="yellow",
+            box=box.ROUNDED,
+        )
+    )
+
+
+# =====================================================================
+# Desktop Alert Commands
+# =====================================================================
+
+@cli.group(name="alert", help="Desktop alert and locate sound management.")
+def alert() -> None:
+    """Desktop alert management (Find This Device)."""
+    pass
+
+
+@alert.command(name="test", help="Trigger a local test of the desktop alert service.")
+@click.option(
+    "--duration",
+    "-d",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Maximum alert duration in seconds.",
+)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def alert_test(ctx: click.Context, duration: float, json_flag: bool) -> None:
+    """Test local alert audio playback and notification companion."""
+    if duration <= 0:
+        raise click.UsageError("Duration must be a positive number greater than 0.")
+
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    result = run_ipc_call(ctx, "alert_test", {"duration": duration})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    backend = result.get("backend", "unknown") if isinstance(result, dict) else "unknown"
+    console.print(
+        Panel(
+            f"[bold]Desktop alert triggered locally.[/]\n\n"
+            f"[cyan]Audio Backend:[/] {backend}\n"
+            f"[cyan]Max Duration:[/]  {duration} seconds\n\n"
+            "[dim]Run [bold]pengulink alert stop[/bold] to silence the alert.[/]",
+            title="[bold red]🔊 Desktop Alert Test (Ringing)[/]",
+            border_style="red",
+            box=box.ROUNDED,
+        )
+    )
+
+
+@alert.command(name="stop", help="Stop any active desktop alert sound immediately.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def alert_stop(ctx: click.Context, json_flag: bool) -> None:
+    """Silence any active alert playback and clear status."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    result = run_ipc_call(ctx, "alert_stop", {})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    stopped = result.get("stopped", False) if isinstance(result, dict) else False
+    if stopped:
+        console.print("[bold green]✓ Desktop alert stopped and silenced successfully.[/]")
+    else:
+        console.print("[dim]No desktop alert is currently active. Alert stopped/silenced.[/]")
+
+
+@alert.command(name="status", help="Display current status of the desktop alert service.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def alert_status(ctx: click.Context, json_flag: bool) -> None:
+    """Show whether the alert service is ringing, audio backend in use, and time remaining."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    result = run_ipc_call(ctx, "alert_status", {})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    is_active = bool(result.get("active", False)) if isinstance(result, dict) else False
+    source = result.get("source", "none") if isinstance(result, dict) else "none"
+    backend = result.get("backend", "none") if isinstance(result, dict) else "none"
+    remaining = result.get("remaining", result.get("remaining_seconds", 0.0)) if isinstance(result, dict) else 0.0
+
+    table = Table(title="[bold cyan]Desktop Alert Service Status[/]", box=box.ROUNDED)
+    table.add_column("Property", style="bold white")
+    table.add_column("Value")
+
+    state_badge = "[bold red]● RINGING (Active)[/]" if is_active else "[dim]○ INACTIVE (Idle)[/]"
+    table.add_row("Status", state_badge)
+    table.add_row("Source", f"[yellow]{source}[/]" if is_active else "[dim]None[/]")
+    table.add_row("Audio Backend", f"[green]{backend}[/]")
+    table.add_row("Remaining Time", f"{remaining:.1f}s" if is_active else "[dim]-[/]")
+
+    console.print(table)
+
+
+# =====================================================================
+# Share Commands Group
+# =====================================================================
+
+@cli.group(name="share", help="Share files, text, and URLs with connected devices.")
+def share() -> None:
+    """Share files, text, and URLs with connected devices."""
+    pass
+
+
+@share.command(name="text", help="Share text snippet with a connected device.")
+@click.argument("device_id", type=str)
+@click.argument("text", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def share_text_cmd(ctx: click.Context, device_id: str, text: str, json_flag: bool) -> None:
+    """Share text snippet with a remote device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    result = run_ipc_call(ctx, "share_text", {"device_id": device_id, "text": text})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    snippet = (text[:60] + "...") if len(text) > 60 else text
+    console.print(
+        Panel(
+            f"[bold]Target Device:[/] [bold cyan]{device_id}[/]\n"
+            f"[bold]Text Content:[/]  {snippet}\n\n"
+            "[green]✓ Text snippet transmitted and shared successfully.[/]",
+            title="[bold blue]📤 Share Text[/]",
+            border_style="blue",
+            box=box.ROUNDED,
+        )
+    )
+
+
+@share.command(name="url", help="Share a web URL with a connected device.")
+@click.argument("device_id", type=str)
+@click.argument("url", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def share_url_cmd(ctx: click.Context, device_id: str, url: str, json_flag: bool) -> None:
+    """Share a web URL with a remote device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    result = run_ipc_call(ctx, "share_url", {"device_id": device_id, "url": url})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    console.print(
+        Panel(
+            f"[bold]Target Device:[/] [bold cyan]{device_id}[/]\n"
+            f"[bold]Shared URL:[/]    [link={url}]{url}[/link]\n\n"
+            "[green]✓ Web URL transmitted and shared successfully.[/]",
+            title="[bold blue]🔗 Share URL[/]",
+            border_style="blue",
+            box=box.ROUNDED,
+        )
+    )
+
+
+@share.command(name="file", help="Share one or more files with a connected device.")
+@click.argument("device_id", type=str)
+@click.argument("file_paths", nargs=-1, required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--open", "open_flag", is_flag=True, default=False, help="Request remote device to open file upon receipt.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def share_file_cmd(ctx: click.Context, device_id: str, file_paths: Tuple[Path, ...], open_flag: bool, json_flag: bool) -> None:
+    """Share one or more files with a remote device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    str_paths = [str(p.resolve()) for p in file_paths]
+    params: Dict[str, Any] = {
+        "device_id": device_id,
+        "open": open_flag,
+        "file_path": str_paths[0] if len(str_paths) == 1 else str_paths,
+    }
+    result = run_ipc_call(ctx, "share_file", params, timeout=120.0)
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    table = Table(title=f"Transferred Files to {device_id}", box=box.ROUNDED)
+    table.add_column("Filename", style="bold white")
+    table.add_column("Size", justify="right", style="cyan")
+    table.add_column("Status", justify="center")
+
+    for p in file_paths:
+        sz = p.stat().st_size
+        sz_str = f"{sz / 1024:.1f} KB" if sz < 1048576 else f"{sz / 1048576:.2f} MB"
+        table.add_row(p.name, sz_str, "[bold green]Transferred[/]")
+
+    console.print(table)
+
+
 if __name__ == "__main__":
     cli()
+

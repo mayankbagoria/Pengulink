@@ -13,6 +13,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Type, TypeVar, Union
 
 logger = logging.getLogger("pengulink.core.events")
@@ -240,6 +241,79 @@ class EventBus:
         await asyncio.gather(*(_safe_invoke(h) for h in handlers), return_exceptions=True)
 
 
+# =====================================================================
+# Find My Phone & Alert Events
+# =====================================================================
+
+@dataclass(frozen=True)
+class FindDeviceAlertTriggeredEvent(Event):
+    """Emitted when the desktop Find This Device alert is triggered (remote or local)."""
+
+    device_id: str = ""
+    source: str = "remote"  # "remote" (Android request) or "local" (CLI test)
+    max_duration: float = 30.0
+
+
+@dataclass(frozen=True)
+class FindDeviceAlertStoppedEvent(Event):
+    """Emitted when an active Find This Device alert is cancelled or stopped."""
+
+    device_id: str = ""
+    reason: str = "toggle"  # "toggle", "manual", "timeout", "shutdown"
+    duration_played: float = 0.0
+
+
+# Canonical aliases for PROJECT.md and AlertService compatibility
+AlertTriggered = FindDeviceAlertTriggeredEvent
+AlertStopped = FindDeviceAlertStoppedEvent
+
+
+# =====================================================================
+# Share Plugin Events
+# =====================================================================
+
+@dataclass(frozen=True)
+class ShareReceivedEvent(Event):
+    """Emitted when incoming text, URL, or file share is received from a paired device."""
+
+    device_id: str = ""
+    share_type: str = "text"  # "text", "url", or "file"
+    text: Optional[str] = None
+    url: Optional[str] = None
+    filename: Optional[str] = None
+    file_path: Optional[Path] = None
+    file_size: Optional[int] = None
+    mime_type: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class FileTransferProgress(Event):
+    """Emitted during active binary payload streaming."""
+
+    device_id: str = ""
+    transfer_id: str = ""
+    filename: str = ""
+    direction: str = "incoming"  # "incoming" or "outgoing"
+    bytes_transferred: int = 0
+    total_bytes: int = 0
+    percentage: float = 0.0
+
+
+@dataclass(frozen=True)
+class FileReceivedEvent(Event):
+    """Emitted when a file transfer successfully completes and is staged into final path."""
+
+    device_id: str = ""
+    file_path: Path = field(default_factory=Path)
+    file_size: int = 0
+    filename: str = ""
+
+
+# Aliases
+ShareReceived = ShareReceivedEvent
+FileReceived = FileReceivedEvent
+
+
 __all__ = [
     "Event",
     "DeviceDiscovered",
@@ -254,5 +328,15 @@ __all__ = [
     "NotificationCleared",
     "ConnectivityReportReceived",
     "ClipboardUpdatedEvent",
+    "FindDeviceAlertTriggeredEvent",
+    "FindDeviceAlertStoppedEvent",
+    "AlertTriggered",
+    "AlertStopped",
+    "ShareReceivedEvent",
+    "FileTransferProgress",
+    "FileReceivedEvent",
+    "ShareReceived",
+    "FileReceived",
     "EventBus",
 ]
+

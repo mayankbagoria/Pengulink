@@ -72,10 +72,14 @@ from pengulink.plugins.clipboard import (
     redact_clipboard,
 )
 from pengulink.plugins.connectivity_report import ConnectivityReportPlugin
+from pengulink.plugins.findmyphone import FindMyPhonePlugin
 from pengulink.plugins.notification import NotificationPlugin, StoredNotification
 from pengulink.plugins.ping import PingPlugin
+from pengulink.plugins.share import SharePlugin
+from pengulink.services.alert import AlertService
 from pengulink.storage.base import DeviceStore
 from pengulink.storage.json_store import JsonStorageBackend
+
 
 logger = logging.getLogger("pengulink.daemon.service")
 
@@ -193,15 +197,35 @@ class PenguLinkDaemon:
             packet_sender=self._send_clipboard_packet,
             capability_checker=self._check_device_clipboard_capability,
         )
+        self.alert_service = AlertService(
+            event_bus=self.event_bus,
+            runtime_dir=getattr(self.config.storage, "runtime_dir", None),
+        )
+        self.findmyphone_plugin = FindMyPhonePlugin(
+            event_bus=self.event_bus,
+            alert_service=self.alert_service,
+            packet_sender=self._send_findmyphone_packet,
+        )
+        self.find_my_phone_plugin = self.findmyphone_plugin
+        self.share_plugin = SharePlugin(
+            event_bus=self.event_bus,
+            packet_sender=self._send_share_packet,
+            is_paired_checker=self.device_store.is_device_paired,
+            peer_resolver=self._resolve_device_peer_info,
+            config=self.config,
+        )
         self.plugin_registry = PluginRegistry(event_bus=self.event_bus)
         self.plugin_registry.register(self.ping_plugin)
         self.plugin_registry.register(self.battery_plugin)
         self.plugin_registry.register(self.notification_plugin)
         self.plugin_registry.register(self.connectivity_plugin)
         self.plugin_registry.register(self.clipboard_plugin)
+        self.plugin_registry.register(self.findmyphone_plugin)
+        self.plugin_registry.register(self.share_plugin)
         if hasattr(self.config, "device"):
             self.config.device.incoming_capabilities = self.plugin_registry.get_all_incoming_capabilities()
             self.config.device.outgoing_capabilities = self.plugin_registry.get_all_outgoing_capabilities()
+
 
         # 4. Cryptographic Credentials (RSA-2048, self-signed X.509, 0600 storage)
         self.config.ensure_directories()
@@ -220,6 +244,8 @@ class PenguLinkDaemon:
             )
             .decode("utf-8")
         )
+        self.share_plugin.local_cert_pem = self.local_cert_pem
+        self.share_plugin.local_key_pem = self.local_key_pem
 
         # 5. Networking Subsystems
         self.tcp_manager = TCPStreamManager(
@@ -392,6 +418,12 @@ class PenguLinkDaemon:
         except Exception as exc:
             logger.debug("Error stopping plugins: %s", exc)
 
+        # Stop AlertService
+        try:
+            await self.alert_service.stop()
+        except Exception as exc:
+            logger.debug("Error stopping alert service: %s", exc)
+
         # 5. Close all active client connections
         conns = list(self._active_connections.values())
         self._active_connections.clear()
@@ -459,6 +491,18 @@ class PenguLinkDaemon:
         """Check if target device has an active open connection."""
         conn = self._active_connections.get(device_id)
         return bool(conn and not conn.is_closed)
+
+    def is_device_paired(self, device_id: str) -> bool:
+        """Check synchronously if device is currently paired."""
+        sm = self._state_machines.get(device_id)
+        if sm and sm.is_paired:
+            return True
+        if hasattr(self._storage_backend, "_devices"):
+            dev = self._storage_backend._devices.get(device_id)
+            if dev:
+                return bool(dev.get("is_paired", False))
+        return False
+
 
     def _register_connection(self, device_id: str, conn: TCPConnection) -> None:
         self._active_connections[device_id] = conn
@@ -907,6 +951,8 @@ class PenguLinkDaemon:
         self.connectivity_plugin.clear_device(device_id)
         if hasattr(self, "clipboard_plugin"):
             self.clipboard_plugin.clear_device(device_id)
+        if hasattr(self, "share_plugin"):
+            await self.share_plugin.cancel_device_transfers(device_id)
         self._unpaired_peer_certs.pop(device_id, None)
         await self._transition_device(device_id, DeviceState.DISCONNECTED, reason="Device explicitly unpaired")
         await self.event_bus.publish(DeviceUnpaired(device_id=device_id))
@@ -942,6 +988,7 @@ class PenguLinkDaemon:
         return {
             "device_id": device_id,
             "success": True,
+            "status": "sent",
             "message": "Ping transmitted",
         }
 
@@ -1031,9 +1078,149 @@ class PenguLinkDaemon:
             raise ClipboardError("Failed to update clipboard backend")
         return success
 
+    def _send_findmyphone_packet(self, arg1: Any, arg2: Optional[Any] = None) -> None:
+        """Transmit findmyphone packet over active TCP connection."""
+        if isinstance(arg1, Packet):
+            packet = arg1
+            device_id = arg2
+        else:
+            device_id = arg1
+            packet = arg2
+        if not device_id or not packet:
+            return
+        conn = self._active_connections.get(device_id)
+        if not conn or conn.is_closed:
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+        conn.write_line(PacketEngine.serialize(packet))
+
+    async def find_phone(self, device_id: str) -> Dict[str, Any]:
+        """Trigger locate alert on remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+
+        conn = self._active_connections.get(device_id)
+        if not conn or conn.is_closed:
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        send_cb = lambda pkt: conn.write_line(PacketEngine.serialize(pkt))
+        packet = await self.findmyphone_plugin.ring_phone(device_id, send_cb)
+
+        return {
+            "status": "transmitted",
+            "device_id": device_id,
+            "packet_id": packet.id,
+            "message": f"Locate request transmitted to device '{device_id}'",
+        }
+
+    def _send_share_packet(self, arg1: Any, arg2: Optional[Any] = None) -> None:
+        """Transmit share packet over active TCP connection."""
+        if isinstance(arg1, Packet):
+            packet = arg1
+            device_id = arg2
+        else:
+            device_id = arg1
+            packet = arg2
+        if not device_id or not packet:
+            return
+        conn = self._active_connections.get(device_id)
+        if not conn or conn.is_closed:
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+        conn.write_line(PacketEngine.serialize(packet))
+
+    async def _resolve_device_peer_info(self, device_id: str) -> Optional[Tuple[str, str]]:
+        """Return (peer_ip, peer_cert_pem) for given device ID."""
+        conn = self._active_connections.get(device_id)
+        peer_ip = conn.peer_ip if conn and hasattr(conn, "peer_ip") else "127.0.0.1"
+
+        # Check device store
+        cert_pem = await self.device_store.get_device_certificate_pem(device_id)
+        if cert_pem:
+            cert_str = cert_pem.decode("utf-8") if isinstance(cert_pem, bytes) else cert_pem
+            return (peer_ip, cert_str)
+
+        disc = self._discovered_devices.get(device_id)
+        if disc and getattr(disc, "certificate_pem", None):
+            return (peer_ip, disc.certificate_pem)
+
+        return None
+
+    async def share_text(self, device_id: str, text: str) -> Dict[str, Any]:
+        """Send text snippet to remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+        conn = self._active_connections.get(device_id)
+        if not conn or conn.is_closed:
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        send_cb = lambda pkt: conn.write_line(PacketEngine.serialize(pkt))
+        return await self.share_plugin.share_text(device_id, text, send_cb)
+
+    async def share_url(self, device_id: str, url: str) -> Dict[str, Any]:
+        """Send URL to remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+        conn = self._active_connections.get(device_id)
+        if not conn or conn.is_closed:
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        send_cb = lambda pkt: conn.write_line(PacketEngine.serialize(pkt))
+        return await self.share_plugin.share_url(device_id, url, send_cb)
+
+    async def share_file(
+        self,
+        device_id: str,
+        file_path: Union[str, Path, List[Union[str, Path]]],
+        open_flag: bool = False,
+    ) -> Dict[str, Any]:
+        """Send file or multiple files to remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+        conn = self._active_connections.get(device_id)
+        if not conn or conn.is_closed:
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        send_cb = lambda pkt: conn.write_line(PacketEngine.serialize(pkt))
+        if isinstance(file_path, list):
+            return await self.share_plugin.share_files(device_id, file_path, send_cb, open_flag)
+        return await self.share_plugin.share_file(device_id, file_path, send_cb, open_flag)
+
     # =====================================================================
     # JSON-RPC 2.0 Method Dispatcher
     # =====================================================================
+
 
     async def _handle_ipc_request(self, method: str, params: Dict[str, Any]) -> Any:
         """Central dispatcher executing JSON-RPC 2.0 requests from the IPC socket."""
@@ -1298,7 +1485,69 @@ class PenguLinkDaemon:
                 "socket_path": str(self.socket_path),
             }
 
+        elif method == "find_phone":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            return await self.find_phone(did)
+
+        elif method == "alert_test":
+            duration = float(params.get("duration", 30.0))
+            if duration <= 0:
+                raise ValueError("Parameter 'duration' must be a positive number")
+            duration = min(duration, 300.0)
+
+            started = await self.alert_service.start_alert(
+                device_id="local_cli",
+                source="local",
+                max_duration=duration,
+            )
+            status = self.alert_service.get_status()
+            return {
+                "status": "ringing" if started else "busy",
+                "source": "local",
+                "duration": duration,
+                "backend": status.get("backend", "unknown"),
+                "message": "Desktop alert started" if started else "Alert already active",
+            }
+
+        elif method == "alert_stop":
+            stopped = await self.alert_service.stop_alert(reason="manual")
+            return {
+                "status": "stopped",
+                "stopped": stopped,
+                "message": "Desktop alert stopped successfully" if stopped else "No active alert was running",
+            }
+
+        elif method == "alert_status":
+            return self.alert_service.get_status()
+
+        elif method == "share_text":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            text = str(params.get("text", ""))
+            return await self.share_text(did, text)
+
+        elif method == "share_url":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            url = str(params.get("url", ""))
+            return await self.share_url(did, url)
+
+        elif method == "share_file":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            fp = params.get("file_path") or params.get("file_paths")
+            if not fp:
+                raise ValueError("Parameter 'file_path' or 'file_paths' is required")
+            open_flag = bool(params.get("open", False))
+            return await self.share_file(did, fp, open_flag)
+
         elif method == "stop_daemon":
+
             asyncio.create_task(self.stop())
             return {
                 "success": True,

@@ -86,6 +86,11 @@ class MockDeviceConfig:
             "kdeconnect.connectivity_report.request",
             "kdeconnect.clipboard",
             "kdeconnect.clipboard.connect",
+            "kdeconnect.findmyphone.request",
+            "kdeconnect.findmyphone",
+            "kdeconnect.share.request",
+            "kdeconnect.share.request.update",
+            "kdeconnect.share",
         ]
     )
     outgoing_capabilities: list[str] = field(
@@ -101,8 +106,14 @@ class MockDeviceConfig:
             "kdeconnect.connectivity_report.request",
             "kdeconnect.clipboard",
             "kdeconnect.clipboard.connect",
+            "kdeconnect.findmyphone.request",
+            "kdeconnect.findmyphone",
+            "kdeconnect.share.request",
+            "kdeconnect.share.request.update",
+            "kdeconnect.share",
         ]
     )
+
     tcp_port_min: int = 1716
     tcp_port_max: int = 1764
     udp_port: int = 1716
@@ -558,7 +569,11 @@ class MockKdeConnectDevice:
     def _dispatch_packet_waiters(self, packet: Packet) -> None:
         remaining: list[tuple[str, asyncio.Future[Packet]]] = []
         for ptype, fut in self._packet_waiters:
-            if not fut.done() and (ptype == "*" or packet.type == ptype):
+            if not fut.done() and (
+                ptype == "*"
+                or packet.type == ptype
+                or (ptype == "kdeconnect.findmyphone.request" and packet.type == "kdeconnect.findmyphone")
+            ):
                 fut.set_result(packet)
             elif not fut.done():
                 remaining.append((ptype, fut))
@@ -846,8 +861,39 @@ class MockKdeConnectDevice:
         return self.last_verification_code or ""
 
     # ------------------------------------------------------------------
+    # Find My Phone & Find This Device Simulators
+    # ------------------------------------------------------------------
+    async def send_find_this_device_request(self) -> Packet:
+        """Simulate phone requesting Linux desktop to ring (Find This Device)."""
+        pkt = Packet(
+            type="kdeconnect.findmyphone.request",
+            body={},
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    def get_find_phone_requests(self) -> list[Packet]:
+        """Return history of all received findmyphone packets from daemon."""
+        return [
+            p for p in self._received_packets
+            if p.type in ("kdeconnect.findmyphone.request", "kdeconnect.findmyphone")
+        ]
+
+    async def wait_for_find_phone_request(self, timeout: float = 5.0) -> Packet:
+        """Wait for daemon to send a kdeconnect.findmyphone.request packet."""
+        existing = self.get_find_phone_requests()
+        if existing:
+            return existing[-1]
+        return await self.wait_for_packet("kdeconnect.findmyphone.request", timeout=timeout)
+
+    def has_received_find_phone_request(self) -> bool:
+        """Return True if mock phone received at least one ring request."""
+        return len(self.get_find_phone_requests()) > 0
+
+    # ------------------------------------------------------------------
     # Chaos & Fault Injection Interface
     # ------------------------------------------------------------------
+
     def configure_chaos(self, **kwargs: Any) -> None:
         """Update declarative chaos options dynamically."""
         for k, v in kwargs.items():
@@ -931,6 +977,116 @@ class MockKdeConnectDevice:
                 pass
             if interval > 0:
                 await asyncio.sleep(interval)
+
+    async def send_share_text(self, text: str) -> Packet:
+        """Transmit text share request to daemon."""
+        pkt = Packet(
+            type="kdeconnect.share.request",
+            body={"text": text},
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_share_url(self, url: str) -> Packet:
+        """Transmit URL share request to daemon."""
+        pkt = Packet(
+            type="kdeconnect.share.request",
+            body={"url": url},
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_share_file(
+        self,
+        filename: str,
+        payload_bytes: bytes,
+        target_daemon_cert_pem: Optional[str] = None,
+        last_modified: Optional[int] = None,
+        creation_time: Optional[int] = None,
+        open_flag: bool = False,
+        number_of_files: int = 1,
+        total_payload_size: Optional[int] = None,
+    ) -> Tuple[Packet, int, asyncio.Server, asyncio.Event]:
+        """Start ephemeral TLS server and transmit file share control packet."""
+        completed_event = asyncio.Event()
+
+        async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                writer.write(payload_bytes)
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                completed_event.set()
+
+        daemon_cert = target_daemon_cert_pem
+        if not daemon_cert and self.paired_peers:
+            daemon_cert = list(self.paired_peers.values())[0]
+
+        ssl_ctx = create_paired_ssl_context(
+            local_cert_pem=self.cert_pem,
+            local_key_pem=self.key_pem,
+            peer_cert_pem=daemon_cert if isinstance(daemon_cert, bytes) else (daemon_cert or "").encode("utf-8"),
+            server_side=True,
+        )
+        server = await asyncio.start_server(_handle_client, host="127.0.0.1", port=0, ssl=ssl_ctx)
+        port = server.sockets[0].getsockname()[1]
+
+        now_ms = int(time.time() * 1000)
+        body: Dict[str, Any] = {
+            "filename": filename,
+            "lastModified": last_modified if last_modified is not None else now_ms,
+            "creationTime": creation_time if creation_time is not None else now_ms,
+            "open": bool(open_flag),
+            "numberOfFiles": number_of_files,
+            "totalPayloadSize": total_payload_size if total_payload_size is not None else len(payload_bytes),
+        }
+
+        pkt = Packet(
+            type="kdeconnect.share.request",
+            body=body,
+            payloadSize=len(payload_bytes),
+            payloadTransferInfo={"port": port},
+        )
+        await self.send_packet(pkt)
+        return pkt, port, server, completed_event
+
+    async def receive_share_file(
+        self,
+        target_port: int,
+        expected_size: int,
+        target_daemon_cert_pem: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> bytes:
+        """Connect outbound to daemon ephemeral payload server and stream file bytes."""
+        daemon_cert = target_daemon_cert_pem
+        if not daemon_cert and self.paired_peers:
+            daemon_cert = list(self.paired_peers.values())[0]
+
+        ssl_ctx = create_paired_ssl_context(
+            local_cert_pem=self.cert_pem,
+            local_key_pem=self.key_pem,
+            peer_cert_pem=daemon_cert if isinstance(daemon_cert, bytes) else (daemon_cert or "").encode("utf-8"),
+            server_side=False,
+        )
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", target_port, ssl=ssl_ctx),
+            timeout=timeout,
+        )
+        try:
+            data = await asyncio.wait_for(reader.readexactly(expected_size), timeout=timeout)
+            return data
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    def get_share_packets(self) -> List[Packet]:
+        """Retrieve all received share packets."""
+        return [p for p in self.received_packets if p.type in ("kdeconnect.share.request", "kdeconnect.share.request.update")]
+
+    async def wait_for_share_packet(self, timeout: float = 5.0) -> Packet:
+        """Await reception of share packet."""
+        return await self.wait_for_packet("kdeconnect.share.request", timeout=timeout)
 
 
 # Convenience Alias

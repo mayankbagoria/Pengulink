@@ -353,6 +353,62 @@ class DaemonNotRunningError(DaemonError):
     """Raised when the CLI attempts to communicate with a daemon that is not running."""
 
 
+# =====================================================================
+# Alert & Audio Exceptions
+# =====================================================================
+
+class AlertError(PenguLinkError):
+    """Base exception for desktop alert service operations."""
+
+
+class AudioBackendError(AlertError):
+    """Raised when an audio backend utility fails or an invalid backend is requested."""
+
+
+class AudioUnavailableError(AlertError):
+    """Raised when no audio playback utility is functional on the host."""
+
+
+# =====================================================================
+# Share & Transfer Exceptions
+# =====================================================================
+
+class ShareError(PenguLinkError):
+    """Base exception for Share feature operations."""
+
+
+class PathTraversalError(PenguLinkError):
+    """Raised when an incoming filename or destination path violates sandbox containment."""
+
+
+class TransferError(ShareError):
+    """Base exception for file transfer operations."""
+
+
+class IncompleteTransferError(TransferError):
+    """Raised when an incoming file transfer terminates before payloadSize bytes are received."""
+
+
+class PayloadSizeExceededError(TransferError):
+    """Raised when an incoming stream exceeds the declared packet payloadSize."""
+
+
+class DestinationDirectoryError(StorageError):
+    """Raised when the resolved download directory cannot be created or is unwritable."""
+
+
+class PayloadTransferError(TransferError):
+    """Base exception for out-of-band payload transfer failures."""
+
+
+class PayloadPortBindingError(PayloadTransferError, PortBindingError):
+    """Raised when no TCP ports in 1739..1764 are available for binding."""
+
+
+class PayloadTimeoutError(PayloadTransferError, ConnectionTimeoutError):
+    """Raised when peer connection or socket I/O times out during payload transfer."""
+
+
 __all__ = [
     "PenguLinkError",
     "ConfigError",
@@ -402,4 +458,17 @@ __all__ = [
     "IPCError",
     "DaemonAlreadyRunningError",
     "DaemonNotRunningError",
+    "AlertError",
+    "AudioBackendError",
+    "AudioUnavailableError",
+    "ShareError",
+    "PathTraversalError",
+    "TransferError",
+    "IncompleteTransferError",
+    "PayloadSizeExceededError",
+    "DestinationDirectoryError",
+    "PayloadTransferError",
+    "PayloadPortBindingError",
+    "PayloadTimeoutError",
 ]
+

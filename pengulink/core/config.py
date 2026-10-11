@@ -247,6 +247,10 @@ class StorageConfig(BaseModel):
     devices_filename: str = Field(default="devices.json")
     sqlite_filename: str = Field(default="pengulink.db")
     ipc_socket_filename: str = Field(default="daemon.sock")
+    download_dir: Optional[Path] = Field(
+        default=None,
+        description="Base directory for received file transfers; resolved via 7-tier order if None",
+    )
 
     @property
     def private_key_path(self) -> Path:
@@ -271,6 +275,10 @@ class StorageConfig(BaseModel):
     @property
     def config_file_path(self) -> Path:
         return self.config_dir / "config.json"
+
+    @property
+    def download_dir_path(self) -> Optional[Path]:
+        return self.download_dir
 
 
 class LoggingConfig(BaseModel):
@@ -464,6 +472,7 @@ class PenguLinkConfig(BaseModel):
             "PENGULINK_CONFIG_DIR": ("storage", "config_dir", Path),
             "PENGULINK_DATA_DIR": ("storage", "data_dir", Path),
             "PENGULINK_RUNTIME_DIR": ("storage", "runtime_dir", Path),
+            "PENGULINK_DOWNLOAD_DIR": ("storage", "download_dir", Path),
             "PENGULINK_LOG_LEVEL": ("logging", "level"),
             "PENGULINK_LOG_FILE": ("logging", "log_file", Path),
         }

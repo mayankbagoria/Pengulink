@@ -124,6 +124,11 @@ class DeviceStateMachine:
         return self._current_state
 
     @property
+    def is_paired(self) -> bool:
+        """Check whether the device state machine is currently in a paired or connected state."""
+        return self._current_state in (DeviceState.PAIRED, DeviceState.CONNECTED)
+
+    @property
     def history(self) -> List[StateTransitionRecord]:
         return list(self._history)
 

@@ -6,6 +6,7 @@ Unix Domain Socket JSON-RPC 2.0 server and client for PenguLink daemon.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -13,6 +14,9 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
 from pengulink.core.exceptions import (
+    AlertError,
+    AudioBackendError,
+    AudioUnavailableError,
     ConnectionClosedError,
     ConnectionTimeoutError,
     DaemonAlreadyRunningError,
@@ -23,7 +27,11 @@ from pengulink.core.exceptions import (
     PairingError,
     PairingRejectedError,
     PairingTimestampExpiredError,
+    PathTraversalError,
+    PayloadTransferError,
     PenguLinkError,
+    ShareError,
+    TransferError,
 )
 from pengulink.plugins.clipboard.backend import ClipboardError, ClipboardUnavailableError
 
@@ -50,6 +58,9 @@ DAEMON_NOT_READY = -32006
 OPERATION_TIMEOUT = -32007
 DAEMON_ALREADY_RUNNING = -32008
 CLIPBOARD_ERROR = -32009
+ALERT_ERROR = -32010
+SHARE_ERROR = -32011
+
 
 
 def resolve_socket_path(socket_path: Optional[Union[Path, str]] = None) -> Path:
@@ -311,7 +322,12 @@ class PenguLinkIPCServer:
             return self._format_error(req_id if has_id else None, INTERNAL_ERROR, str(exc)) if has_id else b""
         except ClipboardError as exc:
             return self._format_error(req_id if has_id else None, CLIPBOARD_ERROR, str(exc)) if has_id else b""
+        except (AlertError, AudioBackendError, AudioUnavailableError) as exc:
+            return self._format_error(req_id if has_id else None, ALERT_ERROR, str(exc)) if has_id else b""
+        except (ShareError, PathTraversalError, TransferError, PayloadTransferError) as exc:
+            return self._format_error(req_id if has_id else None, SHARE_ERROR, str(exc)) if has_id else b""
         except PenguLinkError as exc:
+
             msg = str(exc)
             if "not connected" in msg.lower():
                 code = DEVICE_NOT_CONNECTED
@@ -430,7 +446,17 @@ class PenguLinkIPCClient:
         timeout: Optional[float] = None,
     ) -> Any:
         """Synchronous wrapper for Click CLI commands."""
-        return asyncio.run(self.call(method, params, timeout=timeout))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, self.call(method, params, timeout=timeout))
+                return future.result()
+        else:
+            return asyncio.run(self.call(method, params, timeout=timeout))
 
     async def is_running(self) -> bool:
         """Check if daemon is currently responsive."""
@@ -536,6 +562,26 @@ class PenguLinkIPCClient:
         res = await self.call("get_logs", params)
         return list(res) if isinstance(res, list) else []
 
+    async def find_phone(self, device_id: str) -> Dict[str, Any]:
+        """Trigger remote ring on a connected, paired device."""
+        res = await self.call("find_phone", {"device_id": device_id})
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def alert_test(self, duration: float = 30.0) -> Dict[str, Any]:
+        """Trigger local desktop alert test."""
+        res = await self.call("alert_test", {"duration": duration})
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def alert_stop(self) -> Dict[str, Any]:
+        """Stop any active local desktop alert."""
+        res = await self.call("alert_stop")
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def alert_status(self) -> Dict[str, Any]:
+        """Query current status of the desktop alert service."""
+        res = await self.call("alert_status")
+        return dict(res) if isinstance(res, dict) else {}
+
     async def status(self) -> Dict[str, Any]:
         """Fetch daemon health, uptime, and peer counts."""
         res = await self.call("status")
@@ -544,6 +590,32 @@ class PenguLinkIPCClient:
     async def stop_daemon(self) -> Dict[str, Any]:
         """Request graceful shutdown of the background daemon."""
         res = await self.call("stop_daemon")
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def share_text(self, device_id: str, text: str, timeout: float = 10.0) -> Dict[str, Any]:
+        """Send text to paired device."""
+        res = await self.call("share_text", {"device_id": device_id, "text": text}, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def share_url(self, device_id: str, url: str, timeout: float = 10.0) -> Dict[str, Any]:
+        """Send URL to paired device."""
+        res = await self.call("share_url", {"device_id": device_id, "url": url}, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def share_file(
+        self,
+        device_id: str,
+        file_path: Union[str, Path, List[Union[str, Path]]],
+        open_flag: bool = False,
+        timeout: float = 120.0,
+    ) -> Dict[str, Any]:
+        """Send file(s) to paired device."""
+        payload: Dict[str, Any] = {"device_id": device_id, "open": open_flag}
+        if isinstance(file_path, list):
+            payload["file_paths"] = [str(p) for p in file_path]
+        else:
+            payload["file_path"] = str(file_path)
+        res = await self.call("share_file", payload, timeout=timeout)
         return dict(res) if isinstance(res, dict) else {}
 
 
@@ -568,8 +640,11 @@ __all__ = [
     "OPERATION_TIMEOUT",
     "DAEMON_ALREADY_RUNNING",
     "CLIPBOARD_ERROR",
+    "ALERT_ERROR",
+    "SHARE_ERROR",
     "resolve_socket_path",
     "PenguLinkIPCServer",
     "PenguLinkIPCClient",
     "IPCSocketClient",
 ]
+

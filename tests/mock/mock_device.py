@@ -6,6 +6,7 @@ Virtual KDE Connect Android device simulator for automated integration and E2E t
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -91,6 +92,17 @@ class MockDeviceConfig:
             "kdeconnect.share.request",
             "kdeconnect.share.request.update",
             "kdeconnect.share",
+            "kdeconnect.contacts.request_all_uids_timestamps",
+            "kdeconnect.contacts.request_vcards_by_uid",
+            "kdeconnect.contacts",
+            "kdeconnect.mpris",
+            "kdeconnect.mpris.request",
+            # RemoteCommands Capabilities
+            "kdeconnect.remotecommands",
+            "kdeconnect.remotecommands.request",
+            "kdeconnect.runcommand",
+            "kdeconnect.runcommand.request",
+            "kdeconnect.remoteforcecommand",
         ]
     )
     outgoing_capabilities: list[str] = field(
@@ -111,6 +123,18 @@ class MockDeviceConfig:
             "kdeconnect.share.request",
             "kdeconnect.share.request.update",
             "kdeconnect.share",
+            "kdeconnect.contacts.response_uids_timestamps",
+            "kdeconnect.contacts.response_vcards",
+            "kdeconnect.contacts",
+            "kdeconnect.mpris",
+            "kdeconnect.mpris.request",
+            # RemoteCommands Capabilities
+            "kdeconnect.remotecommands",
+            "kdeconnect.remotecommands.request",
+            "kdeconnect.runcommand",
+            "kdeconnect.runcommand.request",
+            "kdeconnect.runcommand.output",
+            "kdeconnect.remoteforcecommand",
         ]
     )
 
@@ -122,6 +146,13 @@ class MockDeviceConfig:
     auto_pong: bool = False
     auto_battery_reply: bool = True
     auto_connectivity_reply: bool = True
+    auto_contacts_reply: bool = True
+    auto_mpris_reply: bool = True
+    auto_mpris_broadcast: bool = True
+    # RemoteCommands Configuration Flags
+    auto_commands_reply: bool = True
+    auto_command_output: bool = False
+    default_command_list_format: str = "dict"
 
 
 @dataclass
@@ -148,6 +179,27 @@ class ChaosConfig:
     pairing_timestamp_offset: float = 0.0
     auto_reject_pairing: bool = False
     ignore_pairing: bool = False
+
+    contacts_ignore_requests: bool = False
+    contacts_delay: float = 0.0
+    contacts_malform_vcards: bool = False
+    contacts_drop_vcard_response: bool = False
+    contacts_chunk_size: Optional[int] = None
+    contacts_omit_uids: bool = False
+    contacts_send_oversized_vcard: bool = False
+
+    mpris_ignore_requests: bool = False
+    mpris_delay: float = 0.0
+    mpris_corrupt_updates: bool = False
+    mpris_drop_player_list: bool = False
+
+    # RemoteCommands Fault & Chaos Injection
+    commands_ignore_requests: bool = False
+    commands_delay: float = 0.0
+    commands_corrupt_command_list: bool = False
+    commands_malformed_json_string: bool = False
+    commands_drop_output: bool = False
+
 
     packet_interceptor: Optional[Callable[[Packet], Optional[Union[Packet, bytes]]]] = None
 
@@ -196,6 +248,36 @@ class MockKdeConnectDevice:
         self.is_battery_charging: bool = False
         self.last_clipboard_content: Optional[str] = None
         self.last_clipboard_timestamp: Optional[int] = None
+
+        # Contacts Simulation State
+        self._mock_contacts: Dict[str, Dict[str, Any]] = {}
+        self._contacts_requested_uids: List[str] = []
+
+        # MPRIS Simulation State
+        self._mock_players: Dict[str, Dict[str, Any]] = {}
+        self._mpris_requests: List[Packet] = []
+
+        # RemoteCommands Simulation State
+        self._mock_commands: Dict[str, Dict[str, str]] = {
+            "cmd_lock": {
+                "key": "cmd_lock",
+                "name": "Lock Screen",
+                "command": "loginctl lock-session",
+            },
+            "cmd_suspend": {
+                "key": "cmd_suspend",
+                "name": "Suspend System",
+                "command": "systemctl suspend",
+            },
+            "cmd_ring": {
+                "key": "cmd_ring",
+                "name": "Find Device Ring",
+                "command": "echo 'Ring'",
+            },
+        }
+        self._executed_commands: List[str] = []
+        self._command_exec_requests: List[Packet] = []
+
 
     @property
     def is_running(self) -> bool:
@@ -656,6 +738,234 @@ class MockKdeConnectDevice:
             self.last_clipboard_content = packet.body.get("content")
             self.last_clipboard_timestamp = packet.body.get("timestamp")
 
+        # 6. Contacts UID and timestamp request handling
+        elif packet.type == "kdeconnect.contacts.request_all_uids_timestamps":
+            if self.config.auto_contacts_reply and not self.chaos_config.contacts_ignore_requests:
+                if self.chaos_config.contacts_delay > 0:
+                    await asyncio.sleep(self.chaos_config.contacts_delay)
+
+                uids = list(self._mock_contacts.keys())
+                body: Dict[str, Any] = {"uids": uids}
+                for uid in uids:
+                    body[uid] = self._mock_contacts[uid]["timestamp"]
+
+                resp_pkt = Packet(
+                    type="kdeconnect.contacts.response_uids_timestamps",
+                    body=body,
+                )
+                await self.send_packet(resp_pkt)
+
+        # 7. Contacts vCard batch request handling
+        elif packet.type == "kdeconnect.contacts.request_vcards_by_uid":
+            requested_uids = list(packet.body.get("uids", []))
+            self._contacts_requested_uids.extend(requested_uids)
+
+            if self.config.auto_contacts_reply and not self.chaos_config.contacts_ignore_requests:
+                if self.chaos_config.contacts_delay > 0:
+                    await asyncio.sleep(self.chaos_config.contacts_delay)
+
+                if not self.chaos_config.contacts_drop_vcard_response:
+                    chunk_size = self.chaos_config.contacts_chunk_size or len(requested_uids)
+                    chunks = [
+                        requested_uids[i : i + chunk_size]
+                        for i in range(0, len(requested_uids), max(1, chunk_size))
+                    ] if requested_uids else [[]]
+
+                    for chunk in chunks:
+                        body: Dict[str, Any] = {
+                            "uids": [] if self.chaos_config.contacts_omit_uids else list(chunk)
+                        }
+                        for uid in chunk:
+                            if uid in self._mock_contacts:
+                                vcard_str = self._mock_contacts[uid]["vcard"]
+                                if self.chaos_config.contacts_malform_vcards:
+                                    vcard_str = "INVALID_VCARD_BODY_CORRUPT"
+                                body[uid] = vcard_str
+
+                        resp_pkt = Packet(
+                            type="kdeconnect.contacts.response_vcards",
+                            body=body,
+                        )
+                        await self.send_packet(resp_pkt)
+
+        # 8. MPRIS Media Control Request handling
+        elif packet.type == "kdeconnect.mpris.request":
+            self._mpris_requests.append(packet)
+
+            if self.chaos_config.mpris_ignore_requests:
+                return
+
+            if self.chaos_config.mpris_delay > 0:
+                await asyncio.sleep(self.chaos_config.mpris_delay)
+
+            if not self.config.auto_mpris_reply:
+                return
+
+            body = packet.body or {}
+            target_player = body.get("player")
+
+            # 1. Handle requestPlayerList
+            if body.get("requestPlayerList"):
+                if not self.chaos_config.mpris_drop_player_list:
+                    player_list = list(self._mock_players.keys())
+                    resp_pkt = Packet(
+                        type="kdeconnect.mpris",
+                        body={"playerList": player_list, "supportAlbumArtPayload": True},
+                    )
+                    await self.send_packet(resp_pkt)
+
+            # 2. Handle requestNowPlaying
+            if body.get("requestNowPlaying") and target_player in self._mock_players:
+                player_state = self._mock_players[target_player].copy()
+                player_state.pop("last_pos_timestamp", None)
+                resp_pkt = Packet(type="kdeconnect.mpris", body=player_state)
+                await self.send_packet(resp_pkt)
+
+            # 3. Handle requestVolume
+            if body.get("requestVolume") and target_player in self._mock_players:
+                vol = self._mock_players[target_player].get("volume", 50)
+                resp_pkt = Packet(
+                    type="kdeconnect.mpris",
+                    body={"player": target_player, "volume": vol},
+                )
+                await self.send_packet(resp_pkt)
+
+            # 4. Handle Transport Action (Play, Pause, PlayPause, Stop, Next, Previous)
+            action = body.get("action")
+            if action and target_player in self._mock_players:
+                p = self._mock_players[target_player]
+                now = time.time()
+                if action == "Play":
+                    p["isPlaying"] = True
+                    p["last_pos_timestamp"] = now
+                elif action == "Pause":
+                    if p.get("isPlaying", False):
+                        elapsed_ms = int((now - p.get("last_pos_timestamp", now)) * 1000)
+                        p["pos"] = min(p.get("length", 0), p.get("pos", 0) + elapsed_ms)
+                    p["isPlaying"] = False
+                    p["last_pos_timestamp"] = now
+                elif action == "PlayPause":
+                    if p.get("isPlaying", False):
+                        elapsed_ms = int((now - p.get("last_pos_timestamp", now)) * 1000)
+                        p["pos"] = min(p.get("length", 0), p.get("pos", 0) + elapsed_ms)
+                        p["isPlaying"] = False
+                    else:
+                        p["isPlaying"] = True
+                        p["last_pos_timestamp"] = now
+                elif action == "Stop":
+                    p["isPlaying"] = False
+                    p["pos"] = 0
+                    p["last_pos_timestamp"] = now
+                elif action == "Next":
+                    p["title"] = f"{p.get('title', 'Track')} (Next)"
+                    p["pos"] = 0
+                    p["last_pos_timestamp"] = now
+                elif action == "Previous":
+                    p["pos"] = 0
+                    p["last_pos_timestamp"] = now
+
+                if self.config.auto_mpris_broadcast:
+                    state_copy = p.copy()
+                    state_copy.pop("last_pos_timestamp", None)
+                    resp_pkt = Packet(type="kdeconnect.mpris", body=state_copy)
+                    await self.send_packet(resp_pkt)
+
+            # 5. Handle setVolume (0..100)
+            if "setVolume" in body and target_player in self._mock_players:
+                raw_vol = int(body["setVolume"])
+                clamped_vol = max(0, min(100, raw_vol))
+                self._mock_players[target_player]["volume"] = clamped_vol
+                if self.config.auto_mpris_broadcast:
+                    resp_pkt = Packet(
+                        type="kdeconnect.mpris",
+                        body={"player": target_player, "volume": clamped_vol},
+                    )
+                    await self.send_packet(resp_pkt)
+
+            # 6. Handle Seek (Microseconds: us -> ms)
+            if "Seek" in body and target_player in self._mock_players:
+                offset_us = int(body["Seek"])
+                offset_ms = offset_us // 1000
+                p = self._mock_players[target_player]
+                cur_pos = p.get("pos", 0)
+                max_len = p.get("length", 0)
+                new_pos = max(0, min(max_len, cur_pos + offset_ms)) if max_len > 0 else max(0, cur_pos + offset_ms)
+                p["pos"] = new_pos
+                p["last_pos_timestamp"] = time.time()
+                if self.config.auto_mpris_broadcast:
+                    resp_pkt = Packet(
+                        type="kdeconnect.mpris",
+                        body={"player": target_player, "pos": new_pos},
+                    )
+                    await self.send_packet(resp_pkt)
+
+            # 7. Handle SetPosition (Milliseconds: ms)
+            if "SetPosition" in body and target_player in self._mock_players:
+                pos_ms = int(body["SetPosition"])
+                p = self._mock_players[target_player]
+                max_len = p.get("length", 0)
+                new_pos = max(0, min(max_len, pos_ms)) if max_len > 0 else max(0, pos_ms)
+                p["pos"] = new_pos
+                p["last_pos_timestamp"] = time.time()
+                if self.config.auto_mpris_broadcast:
+                    resp_pkt = Packet(
+                        type="kdeconnect.mpris",
+                        body={"player": target_player, "pos": new_pos},
+                    )
+                    await self.send_packet(resp_pkt)
+
+            # 8. Handle setLoopStatus & setShuffle
+            if "setLoopStatus" in body and target_player in self._mock_players:
+                loop_mode = str(body["setLoopStatus"])
+                self._mock_players[target_player]["loopStatus"] = loop_mode
+                if self.config.auto_mpris_broadcast:
+                    await self.send_packet(Packet(type="kdeconnect.mpris", body={"player": target_player, "loopStatus": loop_mode}))
+
+            if "setShuffle" in body and target_player in self._mock_players:
+                shuf = bool(body["setShuffle"])
+                self._mock_players[target_player]["shuffle"] = shuf
+                if self.config.auto_mpris_broadcast:
+                    await self.send_packet(Packet(type="kdeconnect.mpris", body={"player": target_player, "shuffle": shuf}))
+
+        # ------------------------------------------------------------------
+        # 9. Remote Commands Request Handling
+        # ------------------------------------------------------------------
+        elif packet.type in (
+            "kdeconnect.runcommand.request",
+            "kdeconnect.remotecommands.request",
+            "kdeconnect.remoteforcecommand",
+        ):
+            body = packet.body or {}
+
+            # Case A: Remote command list query
+            if body.get("requestCommandList") or (not body.get("key") and packet.type != "kdeconnect.remoteforcecommand"):
+                if self.config.auto_commands_reply and not self.chaos_config.commands_ignore_requests:
+                    if self.chaos_config.commands_delay > 0:
+                        await asyncio.sleep(self.chaos_config.commands_delay)
+                    await self.send_command_list(format=self.config.default_command_list_format)
+
+            # Case B: Remote command execution request
+            if "key" in body:
+                cmd_key = str(body["key"])
+                self._executed_commands.append(cmd_key)
+                self._command_exec_requests.append(packet)
+
+                if self.chaos_config.commands_ignore_requests:
+                    return
+
+                if self.chaos_config.commands_delay > 0:
+                    await asyncio.sleep(self.chaos_config.commands_delay)
+
+                if self.config.auto_command_output and not self.chaos_config.commands_drop_output:
+                    output_msg = (
+                        f"Executed '{cmd_key}' successfully"
+                        if cmd_key in self._mock_commands
+                        else f"Command '{cmd_key}' not found"
+                    )
+                    code = 0 if cmd_key in self._mock_commands else 1
+                    await self.send_command_output(key=cmd_key, output=output_msg, exit_code=code)
+
+
     # ------------------------------------------------------------------
     # Packet Transmission & Helpers
     # ------------------------------------------------------------------
@@ -1088,6 +1398,397 @@ class MockKdeConnectDevice:
         """Await reception of share packet."""
         return await self.wait_for_packet("kdeconnect.share.request", timeout=timeout)
 
+    # ------------------------------------------------------------------
+    # Contacts Feature Simulators & Helpers
+    # ------------------------------------------------------------------
+    def set_mock_contacts(self, contacts: Union[List[Dict[str, Any]], Dict[str, Any]]) -> None:
+        """Populate or replace mock device address book.
+        
+        Accepts:
+          - List of dicts: [{"uid": "1", "timestamp": 1712345678000, "vcard": "BEGIN:VCARD..."}]
+          - Dict mapping: {uid: {"timestamp": ts, "vcard": vcard_str}} or {uid: vcard_str}
+        """
+        self._mock_contacts.clear()
+        now_ms = int(time.time() * 1000)
+        if isinstance(contacts, list):
+            for entry in contacts:
+                uid = str(entry.get("uid", uuid.uuid4().hex[:8]))
+                ts = int(entry.get("timestamp", now_ms))
+                vcard = str(entry.get("vcard", ""))
+                self._mock_contacts[uid] = {"uid": uid, "timestamp": ts, "vcard": vcard}
+        elif isinstance(contacts, dict):
+            for uid, val in contacts.items():
+                uid_str = str(uid)
+                if isinstance(val, dict):
+                    ts = int(val.get("timestamp", now_ms))
+                    vcard = str(val.get("vcard", ""))
+                else:
+                    ts = now_ms
+                    vcard = str(val)
+                self._mock_contacts[uid_str] = {"uid": uid_str, "timestamp": ts, "vcard": vcard}
+
+    def add_mock_contact(self, uid: str, vcard: str, timestamp: Optional[int] = None) -> None:
+        """Add or update a single mock contact."""
+        ts = timestamp if timestamp is not None else int(time.time() * 1000)
+        self._mock_contacts[str(uid)] = {"uid": str(uid), "timestamp": ts, "vcard": str(vcard)}
+
+    def remove_mock_contact(self, uid: str) -> bool:
+        """Remove a mock contact from the phonebook."""
+        return self._mock_contacts.pop(str(uid), None) is not None
+
+    def clear_mock_contacts(self) -> None:
+        """Wipe all mock contacts."""
+        self._mock_contacts.clear()
+
+    def get_mock_contacts_count(self) -> int:
+        """Return total contacts currently staged on the mock phone."""
+        return len(self._mock_contacts)
+
+    async def send_contacts_uids_timestamps(self, uids_timestamps: Dict[str, int]) -> Packet:
+        """Manually transmit kdeconnect.contacts.response_uids_timestamps."""
+        body: Dict[str, Any] = {"uids": list(uids_timestamps.keys())}
+        body.update(uids_timestamps)
+        pkt = Packet(type="kdeconnect.contacts.response_uids_timestamps", body=body)
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_contacts_vcards(self, vcards: Dict[str, str]) -> Packet:
+        """Manually transmit kdeconnect.contacts.response_vcards."""
+        body: Dict[str, Any] = {"uids": list(vcards.keys())}
+        body.update(vcards)
+        pkt = Packet(type="kdeconnect.contacts.response_vcards", body=body)
+        await self.send_packet(pkt)
+        return pkt
+
+    def get_contacts_packets(self) -> List[Packet]:
+        """Return all received contacts packets."""
+        return [
+            p for p in self.received_packets
+            if p.type.startswith("kdeconnect.contacts.")
+        ]
+
+    async def wait_for_contacts_request(
+        self,
+        packet_type: str = "kdeconnect.contacts.request_all_uids_timestamps",
+        timeout: float = 5.0,
+    ) -> Packet:
+        """Wait for incoming contacts request packet."""
+        return await self.wait_for_packet(packet_type, timeout=timeout)
+
+    # ------------------------------------------------------------------
+    # MPRIS Simulation Helpers
+    # ------------------------------------------------------------------
+    def set_mock_players(self, players: Dict[str, Dict[str, Any]]) -> None:
+        """Stage mock media players on the device."""
+        self._mock_players = {}
+        for name, data in players.items():
+            entry = dict(data)
+            entry["player"] = name
+            entry.setdefault("isPlaying", True)
+            entry.setdefault("pos", 0)
+            entry.setdefault("length", 180000)
+            entry.setdefault("volume", 70)
+            entry.setdefault("last_pos_timestamp", time.time())
+            self._mock_players[name] = entry
+
+    def add_mock_player(
+        self,
+        player: str,
+        title: str = "Test Track",
+        artist: str = "Test Artist",
+        album: str = "Test Album",
+        is_playing: bool = True,
+        pos: int = 0,
+        length: int = 240000,
+        volume: int = 80,
+        album_art_url: Optional[str] = None,
+        can_play: bool = True,
+        can_pause: bool = True,
+        can_go_next: bool = True,
+        can_go_previous: bool = True,
+        can_seek: bool = True,
+        loop_status: str = "None",
+        shuffle: bool = False,
+    ) -> None:
+        """Stage or update a single mock player with sensible defaults."""
+        self._mock_players[player] = {
+            "player": player,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "nowPlaying": f"{artist} - {title}",
+            "albumArtUrl": album_art_url or "",
+            "isPlaying": is_playing,
+            "pos": pos,
+            "length": length,
+            "volume": volume,
+            "canPlay": can_play,
+            "canPause": can_pause,
+            "canGoNext": can_go_next,
+            "canGoPrevious": can_go_previous,
+            "canSeek": can_seek,
+            "loopStatus": loop_status,
+            "shuffle": shuffle,
+            "last_pos_timestamp": time.time(),
+        }
+
+    def remove_mock_player(self, player: str) -> bool:
+        """Remove a mock player from the phone."""
+        return self._mock_players.pop(player, None) is not None
+
+    def clear_mock_players(self) -> None:
+        """Clear all staged mock players."""
+        self._mock_players.clear()
+
+    def get_mock_players(self) -> Dict[str, Dict[str, Any]]:
+        """Return dictionary copy of currently staged mock players."""
+        return {k: dict(v) for k, v in self._mock_players.items()}
+
+    async def send_mpris_player_list(self, players: Optional[List[str]] = None) -> Packet:
+        """Transmit kdeconnect.mpris packet advertising available player list."""
+        player_names = players if players is not None else list(self._mock_players.keys())
+        pkt = Packet(
+            type="kdeconnect.mpris",
+            body={"playerList": player_names, "supportAlbumArtPayload": True},
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_mpris_update(
+        self,
+        player: str,
+        title: Optional[str] = None,
+        artist: Optional[str] = None,
+        album: Optional[str] = None,
+        is_playing: Optional[bool] = None,
+        pos: Optional[int] = None,
+        length: Optional[int] = None,
+        volume: Optional[int] = None,
+        can_play: Optional[bool] = None,
+        can_pause: Optional[bool] = None,
+        can_go_next: Optional[bool] = None,
+        can_go_previous: Optional[bool] = None,
+        can_seek: Optional[bool] = None,
+        loop_status: Optional[str] = None,
+        shuffle: Optional[bool] = None,
+        **extra: Any,
+    ) -> Packet:
+        """Transmit incremental or full kdeconnect.mpris player update packet."""
+        body: Dict[str, Any] = {"player": player}
+        if title is not None:
+            body["title"] = title
+        if artist is not None:
+            body["artist"] = artist
+        if album is not None:
+            body["album"] = album
+        if is_playing is not None:
+            body["isPlaying"] = is_playing
+        if pos is not None:
+            body["pos"] = pos
+        if length is not None:
+            body["length"] = length
+        if volume is not None:
+            body["volume"] = volume
+        if can_play is not None:
+            body["canPlay"] = can_play
+        if can_pause is not None:
+            body["canPause"] = can_pause
+        if can_go_next is not None:
+            body["canGoNext"] = can_go_next
+        if can_go_previous is not None:
+            body["canGoPrevious"] = can_go_previous
+        if can_seek is not None:
+            body["canSeek"] = can_seek
+        if loop_status is not None:
+            body["loopStatus"] = loop_status
+        if shuffle is not None:
+            body["shuffle"] = shuffle
+        body.update(extra)
+
+        pkt = Packet(type="kdeconnect.mpris", body=body)
+        await self.send_packet(pkt)
+        return pkt
+
+    def get_mpris_requests(self, action: Optional[str] = None) -> List[Packet]:
+        """Return history of received kdeconnect.mpris.request packets."""
+        if action is None:
+            return list(self._mpris_requests)
+        return [p for p in self._mpris_requests if p.body.get("action") == action]
+
+    async def wait_for_mpris_request(
+        self,
+        action: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> Packet:
+        """Wait for an incoming kdeconnect.mpris.request packet, optionally filtering by action."""
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+
+        while loop.time() - start_time < timeout:
+            for p in self._mpris_requests:
+                if action is None or p.body.get("action") == action:
+                    return p
+            try:
+                pkt = await self.wait_for_packet("kdeconnect.mpris.request", timeout=min(0.2, timeout))
+                if action is None or pkt.body.get("action") == action:
+                    return pkt
+            except ConnectionTimeoutError:
+                pass
+
+        raise ConnectionTimeoutError(
+            f"Timed out waiting for kdeconnect.mpris.request (action={action})",
+            timeout_seconds=timeout,
+        )
+
+    # ------------------------------------------------------------------
+    # RemoteCommands Simulation Helpers (Milestone 15)
+    # ------------------------------------------------------------------
+    def set_mock_commands(
+        self,
+        commands: Union[Dict[str, Dict[str, str]], List[Dict[str, str]]],
+    ) -> None:
+        """Stage mock commands on the device."""
+        self._mock_commands.clear()
+        if isinstance(commands, list):
+            for cmd in commands:
+                k = cmd.get("key")
+                if k:
+                    self._mock_commands[str(k)] = {
+                        "key": str(k),
+                        "name": str(cmd.get("name", k)),
+                        "command": str(cmd.get("command", "")),
+                    }
+        elif isinstance(commands, dict):
+            for k, val in commands.items():
+                if isinstance(val, dict):
+                    self._mock_commands[str(k)] = {
+                        "key": str(val.get("key", k)),
+                        "name": str(val.get("name", k)),
+                        "command": str(val.get("command", "")),
+                    }
+                else:
+                    self._mock_commands[str(k)] = {
+                        "key": str(k),
+                        "name": str(val),
+                        "command": "",
+                    }
+
+    def add_mock_command(self, key: str, name: str, command: str = "") -> None:
+        """Add or update a single staged mock command."""
+        self._mock_commands[key] = {
+            "key": key,
+            "name": name,
+            "command": command,
+        }
+
+    def remove_mock_command(self, key: str) -> bool:
+        """Remove a staged mock command by key."""
+        return self._mock_commands.pop(key, None) is not None
+
+    def clear_mock_commands(self) -> None:
+        """Clear all staged mock commands."""
+        self._mock_commands.clear()
+
+    def get_mock_commands(self) -> Dict[str, Dict[str, str]]:
+        """Return a copy of currently staged mock commands."""
+        return {k: dict(v) for k, v in self._mock_commands.items()}
+
+    async def send_command_list(
+        self,
+        commands: Optional[Union[Dict[str, Dict[str, str]], List[Dict[str, str]]]] = None,
+        format: str = "dict",
+        packet_type: str = "kdeconnect.runcommand",
+    ) -> Packet:
+        """Transmit command list packet advertising available mock commands.
+
+        Args:
+            commands: Optional override commands. Defaults to self._mock_commands.
+            format: "dict" for native JSON dictionary or "string" for JSON-escaped string.
+            packet_type: "kdeconnect.runcommand" or "kdeconnect.remotecommands".
+        """
+        if commands is None:
+            cmd_dict = {k: dict(v) for k, v in self._mock_commands.items()}
+        elif isinstance(commands, list):
+            cmd_dict = {c["key"]: dict(c) for c in commands if "key" in c}
+        else:
+            cmd_dict = {k: dict(v) for k, v in commands.items()}
+
+        if self.chaos_config.commands_corrupt_command_list:
+            body: Dict[str, Any] = {"commandList": 123456}
+        elif self.chaos_config.commands_malformed_json_string:
+            body = {"commandList": '{"unclosed_json: "broken'}
+        elif format == "string":
+            body = {"commandList": json.dumps(cmd_dict)}
+        else:
+            body = {"commandList": cmd_dict}
+
+        pkt = Packet(type=packet_type, body=body)
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_command_output(
+        self,
+        key: str,
+        output: str = "Command executed successfully",
+        exit_code: int = 0,
+    ) -> Packet:
+        """Transmit kdeconnect.runcommand.output packet."""
+        pkt = Packet(
+            type="kdeconnect.runcommand.output",
+            body={
+                "key": key,
+                "output": output,
+                "exitCode": exit_code,
+            },
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    @property
+    def executed_commands(self) -> List[str]:
+        """Return chronological history of executed command keys."""
+        return list(self._executed_commands)
+
+    def get_command_exec_requests(self, key: Optional[str] = None) -> List[Packet]:
+        """Return history of received execution request packets."""
+        if key is None:
+            return list(self._command_exec_requests)
+        return [p for p in self._command_exec_requests if p.body.get("key") == key]
+
+    async def wait_for_command_exec(
+        self,
+        key: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> Packet:
+        """Wait for an incoming command execution packet, optionally filtering by key."""
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+
+        while loop.time() - start_time < timeout:
+            for p in self._command_exec_requests:
+                if key is None or p.body.get("key") == key:
+                    return p
+            try:
+                pkt = await self.wait_for_packet("*", timeout=min(0.2, timeout))
+                if (
+                    pkt.type in (
+                        "kdeconnect.remoteforcecommand",
+                        "kdeconnect.runcommand.request",
+                        "kdeconnect.remotecommands.request",
+                    )
+                    and "key" in (pkt.body or {})
+                ):
+                    if key is None or pkt.body.get("key") == key:
+                        return pkt
+            except ConnectionTimeoutError:
+                pass
+
+        raise ConnectionTimeoutError(
+            f"Timed out waiting for remote command execution (key={key})",
+            timeout_seconds=timeout,
+        )
+
 
 # Convenience Alias
 MockDevice = MockKdeConnectDevice
+

@@ -34,10 +34,13 @@ from pengulink.core.exceptions import (
     CertificateVerificationError,
     ConnectionClosedError,
     ConnectionTimeoutError,
+    ContactNotFoundError,
+    ContactsError,
     DeviceNotFoundError,
     InvalidStateTransitionError,
     PairingError,
     PairingRejectedError,
+    SyncTimeoutError,
 )
 from pengulink.core.state_machine import DeviceState, DeviceStateMachine
 from pengulink.crypto.certificate import (
@@ -72,13 +75,29 @@ from pengulink.plugins.clipboard import (
     redact_clipboard,
 )
 from pengulink.plugins.connectivity_report import ConnectivityReportPlugin
+from pengulink.plugins.contacts.plugin import ContactsPlugin
 from pengulink.plugins.findmyphone import FindMyPhonePlugin
 from pengulink.plugins.notification import NotificationPlugin, StoredNotification
 from pengulink.plugins.ping import PingPlugin
 from pengulink.plugins.share import SharePlugin
+from pengulink.plugins.mpris import (
+    MprisControl,
+    MprisHostAdapter,
+    MprisRemote,
+    detect_mpris_adapter,
+)
+from pengulink.plugins.remotecommands import RemoteCommandsPlugin
 from pengulink.services.alert import AlertService
 from pengulink.storage.base import DeviceStore
 from pengulink.storage.json_store import JsonStorageBackend
+from pengulink.core.exceptions import (
+    ActionUnsupportedError,
+    MprisError,
+    MprisPlayerNotFoundError,
+    RemoteCommandError,
+    RemoteCommandNotFoundError,
+)
+
 
 
 logger = logging.getLogger("pengulink.daemon.service")
@@ -166,6 +185,7 @@ class PenguLinkDaemon:
         config: Optional[Union[Config, PenguLinkConfig]] = None,
         socket_path: Optional[Union[Path, str]] = None,
         clipboard_backend: Optional[ClipboardBackend] = None,
+        mpris_adapter: Optional[MprisHostAdapter] = None,
     ) -> None:
         if config is None:
             self.config = Config.load()
@@ -222,9 +242,38 @@ class PenguLinkDaemon:
         self.plugin_registry.register(self.clipboard_plugin)
         self.plugin_registry.register(self.findmyphone_plugin)
         self.plugin_registry.register(self.share_plugin)
+        contacts_storage_dir = getattr(self.config.storage, "data_dir", None) or getattr(
+            self.config.storage, "devices_store_path", Path(".")
+        ).parent
+        self.contacts_plugin = ContactsPlugin(
+            event_bus=self.event_bus,
+            config=self.config,
+            data_dir=contacts_storage_dir,
+        )
+        self.plugin_registry.register(self.contacts_plugin)
+        self.mpris_control = MprisControl(
+            event_bus=self.event_bus,
+            adapter=mpris_adapter or detect_mpris_adapter(),
+            packet_sender=self._send_mpris_packet,
+        )
+        self.plugin_registry.register(self.mpris_control)
+        self.mpris_remote = MprisRemote(
+            event_bus=self.event_bus,
+            packet_sender=self._send_mpris_packet,
+        )
+        self.plugin_registry.register(self.mpris_remote)
+
+        # RemoteCommands Plugin (Milestone 15)
+        self.remote_commands_plugin = RemoteCommandsPlugin(
+            event_bus=self.event_bus,
+            packet_sender=self._send_remote_commands_packet,
+        )
+        self.plugin_registry.register(self.remote_commands_plugin)
+
         if hasattr(self.config, "device"):
             self.config.device.incoming_capabilities = self.plugin_registry.get_all_incoming_capabilities()
             self.config.device.outgoing_capabilities = self.plugin_registry.get_all_outgoing_capabilities()
+
 
 
         # 4. Cryptographic Credentials (RSA-2048, self-signed X.509, 0600 storage)
@@ -780,6 +829,12 @@ class PenguLinkDaemon:
             self.connectivity_plugin.clear_device(remote_id)
             if hasattr(self, "clipboard_plugin"):
                 self.clipboard_plugin.clear_device(remote_id)
+            if hasattr(self, "contacts_plugin"):
+                self.contacts_plugin.on_device_unpaired(remote_id)
+            if hasattr(self, "mpris_remote"):
+                self.mpris_remote.on_device_unpaired(remote_id)
+            if hasattr(self, "remote_commands_plugin"):
+                self.remote_commands_plugin.on_device_unpaired(remote_id)
             self._pairing_sessions.pop(remote_id, None)
             self._unpaired_peer_certs.pop(remote_id, None)
             await self._transition_device(remote_id, DeviceState.DISCONNECTED, reason="Peer revoked or rejected pairing")
@@ -953,6 +1008,12 @@ class PenguLinkDaemon:
             self.clipboard_plugin.clear_device(device_id)
         if hasattr(self, "share_plugin"):
             await self.share_plugin.cancel_device_transfers(device_id)
+        if hasattr(self, "contacts_plugin"):
+            self.contacts_plugin.on_device_unpaired(device_id)
+        if hasattr(self, "mpris_remote"):
+            self.mpris_remote.on_device_unpaired(device_id)
+        if hasattr(self, "remote_commands_plugin"):
+            self.remote_commands_plugin.on_device_unpaired(device_id)
         self._unpaired_peer_certs.pop(device_id, None)
         await self._transition_device(device_id, DeviceState.DISCONNECTED, reason="Device explicitly unpaired")
         await self.event_bus.publish(DeviceUnpaired(device_id=device_id))
@@ -1218,8 +1279,405 @@ class PenguLinkDaemon:
         return await self.share_plugin.share_file(device_id, file_path, send_cb, open_flag)
 
     # =====================================================================
+    # Contacts Feature Actions
+    # =====================================================================
+
+    async def sync_contacts(
+        self,
+        device_id: str,
+        force: bool = False,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Trigger contact synchronization with connected peer device over primary TLS connection."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+
+        if not await self.device_store.is_device_paired(device_id):
+            raise PairingError(f"Device '{device_id}' is not paired; contacts sync requires paired trust")
+
+        conn = self._active_connections.get(device_id)
+        if not conn or conn.is_closed:
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        send_cb = lambda pkt: conn.write_line(PacketEngine.serialize(pkt))
+        sync_kwargs: Dict[str, Any] = {"force": force}
+        if timeout is not None:
+            sync_kwargs["timeout"] = timeout
+        res = await self.contacts_plugin.sync(device_id, send_cb, **sync_kwargs)
+        return res.to_dict() if hasattr(res, "to_dict") else dict(res)
+
+    async def list_contacts(
+        self,
+        device_id: str,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """List cached contacts for a paired or known device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if offset < 0:
+            raise ValueError("Parameter 'offset' must be non-negative")
+        if limit is not None and limit < 0:
+            raise ValueError("Parameter 'limit' must be non-negative")
+
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+
+        total, contacts = await self.contacts_plugin.list_contacts(
+            device_id, limit=limit, offset=offset
+        )
+        return {
+            "device_id": device_id,
+            "is_connected": self.is_device_connected(device_id),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "contacts": [c.to_dict() if hasattr(c, "to_dict") else c for c in contacts],
+        }
+
+    async def search_contacts(self, device_id: str, query: str) -> Dict[str, Any]:
+        """Search cached contacts for a device matching query string."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if query is None:
+            query = ""
+
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+
+        matches = await self.contacts_plugin.search_contacts(device_id, query)
+        return {
+            "device_id": device_id,
+            "query": query,
+            "is_connected": self.is_device_connected(device_id),
+            "count": len(matches),
+            "matches": [c.to_dict() if hasattr(c, "to_dict") else c for c in matches],
+        }
+
+    async def get_contact(self, device_id: str, uid: str) -> Dict[str, Any]:
+        """Retrieve an individual contact record by UID from local cache."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not uid or not isinstance(uid, str):
+            raise ValueError("Parameter 'uid' is required and must be a string")
+
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+
+        contact = await self.contacts_plugin.get_contact(device_id, uid)
+        if not contact:
+            raise ContactNotFoundError(f"Contact UID '{uid}' not found for device '{device_id}'")
+
+        return {
+            "device_id": device_id,
+            "contact": contact.to_dict() if hasattr(contact, "to_dict") else contact,
+        }
+
+    # =====================================================================
+    # MPRIS Media Control Methods
+    # =====================================================================
+
+    def _send_mpris_packet(self, arg1: Any, arg2: Optional[Any] = None) -> None:
+        """Transmit MPRIS packet over active TCP connection."""
+        if isinstance(arg1, Packet):
+            packet = arg1
+            device_id = arg2
+        else:
+            device_id = arg1
+            packet = arg2
+        if not device_id or not packet:
+            return
+        self.send_packet(device_id, packet)
+
+    async def mpris_list_players(self, device_id: str) -> Dict[str, Any]:
+        """Enumerate media players reported by remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+
+        is_conn = self.is_device_connected(device_id)
+        players = self.mpris_remote.get_players(device_id)
+        active = self.mpris_remote.get_active_player(device_id)
+
+        if is_conn and not players:
+            try:
+                await self.mpris_remote.request_player_list(device_id)
+            except Exception:
+                pass
+
+        return {
+            "device_id": device_id,
+            "is_connected": is_conn,
+            "players": players,
+            "active_player": active,
+        }
+
+    async def mpris_get_status(self, device_id: str, player: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieve media player playback status and track metadata."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' is unknown")
+
+        is_conn = self.is_device_connected(device_id)
+        st = self.mpris_remote.get_player_state(device_id, player)
+        if player and not st:
+            raise MprisPlayerNotFoundError(f"Player '{player}' not found on device '{device_id}'")
+
+        target_player = player or (st.player if st else (self.mpris_remote.get_active_player(device_id) or ""))
+        status_dict = st.to_dict() if st else None
+
+        return {
+            "device_id": device_id,
+            "is_connected": is_conn,
+            "player": target_player,
+            "status": status_dict,
+        }
+
+    async def mpris_send_action(
+        self,
+        device_id: str,
+        action: str,
+        player: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Send transport control action (Play, Pause, PlayPause, Stop, Next, Previous)."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not action or not isinstance(action, str):
+            raise ValueError("Parameter 'action' is required and must be a string")
+
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        pkt = await self.mpris_remote.send_action(device_id, action, player=player)
+        return {
+            "device_id": device_id,
+            "player": pkt.body.get("player"),
+            "action": action,
+            "success": True,
+        }
+
+    async def mpris_set_volume(
+        self,
+        device_id: str,
+        volume: int,
+        player: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Set volume percentage (0..100) on remote player."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not isinstance(volume, (int, float)):
+            raise ValueError("Parameter 'volume' must be a numeric integer")
+
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        clamped = max(0, min(100, int(volume)))
+        pkt = await self.mpris_remote.set_volume(device_id, clamped, player=player)
+        return {
+            "device_id": device_id,
+            "player": pkt.body.get("player"),
+            "volume": clamped,
+            "success": True,
+        }
+
+    async def mpris_seek(
+        self,
+        device_id: str,
+        offset_ms: int,
+        player: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Seek relative track position in milliseconds."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not isinstance(offset_ms, (int, float)):
+            raise ValueError("Parameter 'offset_ms' must be an integer")
+
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        pkt = await self.mpris_remote.seek(device_id, int(offset_ms), player=player)
+        return {
+            "device_id": device_id,
+            "player": pkt.body.get("player"),
+            "offset_ms": int(offset_ms),
+            "success": True,
+        }
+
+    async def mpris_set_position(
+        self,
+        device_id: str,
+        position_ms: int,
+        player: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Set absolute track position in milliseconds."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not isinstance(position_ms, (int, float)) or int(position_ms) < 0:
+            raise ValueError("Parameter 'position_ms' must be a non-negative integer")
+
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        pkt = await self.mpris_remote.set_position(device_id, int(position_ms), player=player)
+        return {
+            "device_id": device_id,
+            "player": pkt.body.get("player"),
+            "position_ms": int(position_ms),
+            "success": True,
+        }
+
+    async def mpris_request_player_list(self, device_id: str) -> Dict[str, Any]:
+        """Request fresh media player list from remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        await self.mpris_remote.request_player_list(device_id)
+        return {
+            "device_id": device_id,
+            "success": True,
+            "message": "Player list request dispatched",
+        }
+
+    # =====================================================================
+    # Remote Commands Feature Actions (Milestone 15)
+    # =====================================================================
+
+    def _send_remote_commands_packet(self, arg1: Any, arg2: Optional[Any] = None) -> None:
+        """Transmit RemoteCommands packet over active TCP connection."""
+        if isinstance(arg1, Packet):
+            packet = arg1
+            device_id = arg2
+        else:
+            device_id = arg1
+            packet = arg2
+        if not device_id or not packet:
+            return
+        self.send_packet(device_id, packet)
+
+    async def list_remote_commands(self, device_id: str) -> List[Dict[str, Any]]:
+        """List cached remote commands for a device.
+
+        If device is connected and commands have not been cached yet, triggers an
+        asynchronous request to fetch them in the background.
+        """
+        device_id = device_id.strip() if isinstance(device_id, str) else ""
+        if not device_id:
+            raise ValueError("Parameter 'device_id' must not be empty")
+
+        is_known = (
+            device_id in self._discovered_devices
+            or await self.device_store.is_device_paired(device_id)
+            or device_id in self._active_connections
+            or device_id in self._state_machines
+        )
+        if not is_known:
+            raise DeviceNotFoundError(f"Device '{device_id}' not found")
+
+        cmds = self.remote_commands_plugin.get_commands(device_id)
+        if not cmds and self.is_device_connected(device_id):
+            try:
+                await self.remote_commands_plugin.request_command_list(device_id)
+            except Exception as exc:
+                logger.debug("Automatic command list request failed for %s: %s", device_id, exc)
+
+        return [cmd.to_dict() for cmd in cmds]
+
+    async def request_remote_commands(self, device_id: str) -> Dict[str, Any]:
+        """Request remote peer to re-advertise its available command list."""
+        device_id = device_id.strip() if isinstance(device_id, str) else ""
+        if not device_id:
+            raise ValueError("Parameter 'device_id' must not be empty")
+
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        await self.remote_commands_plugin.request_command_list(device_id)
+        return {
+            "device_id": device_id,
+            "status": "requested",
+            "message": f"Command list request transmitted to device '{device_id}'",
+        }
+
+    async def execute_remote_command(self, device_id: str, key: str) -> Dict[str, Any]:
+        """Transmit remote command execution request to device.
+
+        Verifies that the command key exists if commands are cached.
+        """
+        device_id = device_id.strip() if isinstance(device_id, str) else ""
+        if not device_id:
+            raise ValueError("Parameter 'device_id' must not be empty")
+
+        key = key.strip() if isinstance(key, str) else ""
+        if not key:
+            raise ValueError("Parameter 'key' must not be empty")
+
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+
+        # If commands are cached for this device, validate key existence
+        cached_cmd = self.remote_commands_plugin.get_command(device_id, key)
+        all_cached = self.remote_commands_plugin.get_commands(device_id)
+        if all_cached and cached_cmd is None:
+            raise RemoteCommandNotFoundError(f"Command '{key}' not found on device '{device_id}'")
+
+        await self.remote_commands_plugin.execute_command(device_id, key)
+        return {
+            "device_id": device_id,
+            "key": key,
+            "status": "transmitted",
+            "message": f"Execution request for command '{key}' transmitted to device '{device_id}'",
+        }
+
+    # =====================================================================
     # JSON-RPC 2.0 Method Dispatcher
     # =====================================================================
+
 
 
     async def _handle_ipc_request(self, method: str, params: Dict[str, Any]) -> Any:
@@ -1545,6 +2003,120 @@ class PenguLinkDaemon:
                 raise ValueError("Parameter 'file_path' or 'file_paths' is required")
             open_flag = bool(params.get("open", False))
             return await self.share_file(did, fp, open_flag)
+
+        elif method == "contacts_sync":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            force = bool(params.get("force", False))
+            timeout_param = params.get("timeout")
+            timeout_val = float(timeout_param) if timeout_param is not None else None
+            return await self.sync_contacts(did, force=force, timeout=timeout_val)
+
+        elif method == "contacts_list":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            raw_limit = params.get("limit")
+            limit = int(raw_limit) if raw_limit is not None else None
+            offset = int(params.get("offset", 0))
+            return await self.list_contacts(did, limit=limit, offset=offset)
+
+        elif method == "contacts_search":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            query = str(params.get("query", ""))
+            return await self.search_contacts(did, query)
+
+        elif method == "contacts_get":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            uid = str(params.get("uid", ""))
+            if not uid:
+                raise ValueError("Parameter 'uid' is required and must be a string")
+            return await self.get_contact(did, uid)
+
+        elif method == "mpris_list_players":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            return await self.mpris_list_players(did)
+
+        elif method == "mpris_get_status":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            player = params.get("player")
+            return await self.mpris_get_status(did, player=player)
+
+        elif method == "mpris_send_action":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            action = params.get("action")
+            if not action or not isinstance(action, str):
+                raise ValueError("Parameter 'action' is required and must be a string")
+            player = params.get("player")
+            return await self.mpris_send_action(did, action, player=player)
+
+        elif method == "mpris_set_volume":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            if "volume" not in params:
+                raise ValueError("Parameter 'volume' is required")
+            volume = int(params["volume"])
+            player = params.get("player")
+            return await self.mpris_set_volume(did, volume, player=player)
+
+        elif method == "mpris_seek":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            if "offset_ms" not in params:
+                raise ValueError("Parameter 'offset_ms' is required")
+            offset_ms = int(params["offset_ms"])
+            player = params.get("player")
+            return await self.mpris_seek(did, offset_ms, player=player)
+
+        elif method == "mpris_set_position":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            if "position_ms" not in params:
+                raise ValueError("Parameter 'position_ms' is required")
+            position_ms = int(params["position_ms"])
+            player = params.get("player")
+            return await self.mpris_set_position(did, position_ms, player=player)
+
+        elif method == "mpris_request_player_list":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            return await self.mpris_request_player_list(did)
+
+        elif method in ("list_remote_commands", "remotecommands_list"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            return await self.list_remote_commands(did)
+
+        elif method in ("request_remote_commands", "remotecommands_request"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            return await self.request_remote_commands(did)
+
+        elif method in ("execute_remote_command", "remotecommands_run", "remotecommands_exec"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            key = params.get("key")
+            if not key or not isinstance(key, str):
+                raise ValueError("Parameter 'key' is required and must be a string")
+            return await self.execute_remote_command(did, key)
 
         elif method == "stop_daemon":
 

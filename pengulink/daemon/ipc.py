@@ -14,23 +14,32 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
 from pengulink.core.exceptions import (
+    ActionUnsupportedError,
     AlertError,
     AudioBackendError,
     AudioUnavailableError,
     ConnectionClosedError,
     ConnectionTimeoutError,
+    ContactNotFoundError,
+    ContactsError,
     DaemonAlreadyRunningError,
     DaemonNotRunningError,
     DeviceNotFoundError,
     InvalidStateTransitionError,
     IPCError,
+    MprisAdapterError,
+    MprisError,
+    MprisPlayerNotFoundError,
     PairingError,
     PairingRejectedError,
     PairingTimestampExpiredError,
     PathTraversalError,
     PayloadTransferError,
     PenguLinkError,
+    RemoteCommandError,
+    RemoteCommandNotFoundError,
     ShareError,
+    SyncTimeoutError,
     TransferError,
 )
 from pengulink.plugins.clipboard.backend import ClipboardError, ClipboardUnavailableError
@@ -60,6 +69,10 @@ DAEMON_ALREADY_RUNNING = -32008
 CLIPBOARD_ERROR = -32009
 ALERT_ERROR = -32010
 SHARE_ERROR = -32011
+CONTACTS_ERROR = -32012
+MPRIS_ERROR = -32013
+REMOTE_COMMANDS_ERROR = -32014
+
 
 
 
@@ -303,6 +316,13 @@ class PenguLinkIPCServer:
             return self._format_error(req_id if has_id else None, DEVICE_NOT_FOUND, str(exc)) if has_id else b""
         except (PairingRejectedError, PairingTimestampExpiredError, PairingError) as exc:
             return self._format_error(req_id if has_id else None, PAIRING_ERROR, str(exc)) if has_id else b""
+        except (ContactsError, ContactNotFoundError, SyncTimeoutError) as exc:
+            return self._format_error(req_id if has_id else None, CONTACTS_ERROR, str(exc)) if has_id else b""
+        except (MprisError, MprisPlayerNotFoundError, ActionUnsupportedError, MprisAdapterError) as exc:
+            return self._format_error(req_id if has_id else None, MPRIS_ERROR, str(exc)) if has_id else b""
+        except (RemoteCommandError, RemoteCommandNotFoundError) as exc:
+            return self._format_error(req_id if has_id else None, REMOTE_COMMANDS_ERROR, str(exc)) if has_id else b""
+
         except InvalidStateTransitionError as exc:
             return self._format_error(req_id if has_id else None, INVALID_STATE_TRANSITION, str(exc)) if has_id else b""
         except (ConnectionTimeoutError, asyncio.TimeoutError, TimeoutError) as exc:
@@ -618,6 +638,184 @@ class PenguLinkIPCClient:
         res = await self.call("share_file", payload, timeout=timeout)
         return dict(res) if isinstance(res, dict) else {}
 
+    async def contacts_sync(
+        self,
+        device_id: str,
+        force: bool = False,
+        sync_timeout: Optional[float] = None,
+        timeout: float = 60.0,
+    ) -> Dict[str, Any]:
+        """Trigger contact synchronization with connected peer device."""
+        params: Dict[str, Any] = {"device_id": device_id, "force": force}
+        if sync_timeout is not None:
+            params["timeout"] = sync_timeout
+        res = await self.call("contacts_sync", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def contacts_list(
+        self,
+        device_id: str,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Fetch list of cached contacts for a device."""
+        params: Dict[str, Any] = {"device_id": device_id, "offset": offset}
+        if limit is not None:
+            params["limit"] = limit
+        res = await self.call("contacts_list", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def contacts_search(
+        self,
+        device_id: str,
+        query: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Search contacts by query string across name, phone, email, organization."""
+        params: Dict[str, Any] = {"device_id": device_id, "query": query}
+        res = await self.call("contacts_search", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def contacts_get(
+        self,
+        device_id: str,
+        uid: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Fetch single contact by UID."""
+        params: Dict[str, Any] = {"device_id": device_id, "uid": uid}
+        res = await self.call("contacts_get", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def mpris_list_players(
+        self,
+        device_id: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Fetch media player list for a device."""
+        params: Dict[str, Any] = {"device_id": device_id}
+        res = await self.call("mpris_list_players", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def mpris_get_status(
+        self,
+        device_id: str,
+        player: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Fetch media player status and metadata for a device."""
+        params: Dict[str, Any] = {"device_id": device_id}
+        if player is not None:
+            params["player"] = player
+        res = await self.call("mpris_get_status", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def mpris_send_action(
+        self,
+        device_id: str,
+        action: str,
+        player: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Send media action (Play, Pause, PlayPause, Stop, Next, Previous) to device."""
+        params: Dict[str, Any] = {"device_id": device_id, "action": action}
+        if player is not None:
+            params["player"] = player
+        res = await self.call("mpris_send_action", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def mpris_set_volume(
+        self,
+        device_id: str,
+        volume: int,
+        player: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Set volume percentage (0..100) on remote media player."""
+        params: Dict[str, Any] = {"device_id": device_id, "volume": volume}
+        if player is not None:
+            params["player"] = player
+        res = await self.call("mpris_set_volume", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def mpris_seek(
+        self,
+        device_id: str,
+        offset_ms: int,
+        player: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Seek relative position in milliseconds on remote media player."""
+        params: Dict[str, Any] = {"device_id": device_id, "offset_ms": offset_ms}
+        if player is not None:
+            params["player"] = player
+        res = await self.call("mpris_seek", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def mpris_set_position(
+        self,
+        device_id: str,
+        position_ms: int,
+        player: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Set absolute track position in milliseconds on remote media player."""
+        params: Dict[str, Any] = {"device_id": device_id, "position_ms": position_ms}
+        if player is not None:
+            params["player"] = player
+        res = await self.call("mpris_set_position", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def mpris_request_player_list(
+        self,
+        device_id: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Request updated player list from remote device."""
+        params: Dict[str, Any] = {"device_id": device_id}
+        res = await self.call("mpris_request_player_list", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    # =====================================================================
+    # Remote Commands Methods (Milestone 15)
+    # =====================================================================
+
+    async def list_remote_commands(
+        self,
+        device_id: str,
+        timeout: float = 10.0,
+    ) -> List[Dict[str, Any]]:
+        """List configured remote commands for device."""
+        params: Dict[str, Any] = {"device_id": device_id}
+        res = await self.call("list_remote_commands", params, timeout=timeout)
+        return list(res) if isinstance(res, list) else []
+
+    async def request_remote_commands(
+        self,
+        device_id: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Request remote peer to re-advertise its available command list."""
+        params: Dict[str, Any] = {"device_id": device_id}
+        res = await self.call("request_remote_commands", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def execute_remote_command(
+        self,
+        device_id: str,
+        key: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Transmit remote command execution request to device."""
+        params: Dict[str, Any] = {"device_id": device_id, "key": key}
+        res = await self.call("execute_remote_command", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    # Aliases
+    remotecommands_list = list_remote_commands
+    remotecommands_run = execute_remote_command
+
 
 # Convenience Alias
 IPCSocketClient = PenguLinkIPCClient
@@ -642,9 +840,13 @@ __all__ = [
     "CLIPBOARD_ERROR",
     "ALERT_ERROR",
     "SHARE_ERROR",
+    "CONTACTS_ERROR",
+    "MPRIS_ERROR",
+    "REMOTE_COMMANDS_ERROR",
     "resolve_socket_path",
     "PenguLinkIPCServer",
     "PenguLinkIPCClient",
     "IPCSocketClient",
 ]
+
 

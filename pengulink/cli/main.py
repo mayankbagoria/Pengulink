@@ -6,6 +6,7 @@ Interactive Debug CLI for PenguLink daemon powered by Click and Rich.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import signal
@@ -17,6 +18,7 @@ from typing import Any, Dict, List, Optional
 import click
 from rich import box
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -1057,6 +1059,718 @@ def share_file_cmd(ctx: click.Context, device_id: str, file_paths: Tuple[Path, .
     console.print(table)
 
 
+# =====================================================================
+# Contacts Commands
+# =====================================================================
+
+def format_phone_type_badge(phone_type: str) -> str:
+    """Format phone label into a colored Rich badge."""
+    ptype = (phone_type or "CELL").upper()
+    badges = {
+        "CELL": "[bold cyan]CELL[/]",
+        "MOBILE": "[bold cyan]MOB[/]",
+        "WORK": "[bold blue]WORK[/]",
+        "HOME": "[bold green]HOME[/]",
+        "VOICE": "[bold magenta]VOICE[/]",
+        "MAIN": "[bold purple]MAIN[/]",
+        "OTHER": "[dim]OTHER[/]",
+    }
+    return badges.get(ptype, f"[dim]{ptype}[/]")
+
+
+def format_email_type_badge(email_type: str) -> str:
+    """Format email label into a colored Rich badge."""
+    etype = (email_type or "HOME").upper()
+    badges = {
+        "HOME": "[bold yellow]HOME[/]",
+        "WORK": "[bold blue]WORK[/]",
+        "INTERNET": "[bold cyan]NET[/]",
+        "OTHER": "[dim]OTHER[/]",
+    }
+    return badges.get(etype, f"[dim]{etype}[/]")
+
+
+def format_contact_phones(phones: List[Dict[str, Any]]) -> str:
+    """Format phone numbers with badges for table row display."""
+    if not phones:
+        return "[dim]-[/]"
+    formatted = []
+    for p in phones:
+        if isinstance(p, dict):
+            num = p.get("number", "")
+            ptype = p.get("type", "CELL")
+            badge = format_phone_type_badge(ptype)
+            formatted.append(f"{badge} {num}")
+        else:
+            formatted.append(str(p))
+    return "\n".join(formatted)
+
+
+def format_contact_emails(emails: List[Dict[str, Any]]) -> str:
+    """Format email addresses with badges for table row display."""
+    if not emails:
+        return "[dim]-[/]"
+    formatted = []
+    for e in emails:
+        if isinstance(e, dict):
+            addr = e.get("email", "")
+            etype = e.get("type", "HOME")
+            badge = format_email_type_badge(etype)
+            formatted.append(f"{badge} {addr}")
+        else:
+            formatted.append(str(e))
+    return "\n".join(formatted)
+
+
+@cli.group(name="contacts", help="Manage and inspect synchronized contacts from connected devices.")
+def contacts() -> None:
+    """Contacts synchronization and address book management."""
+    pass
+
+
+@contacts.command(name="list", help="List synchronized contacts for a device.")
+@click.argument("device_id", type=str)
+@click.option("--limit", "-l", type=int, default=None, help="Maximum number of contacts to display.")
+@click.option("--offset", "-o", type=int, default=0, help="Offset into contact list for pagination.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def contacts_list_cmd(ctx: click.Context, device_id: str, limit: Optional[int], offset: int, json_flag: bool) -> None:
+    """List synchronized contacts for a paired or known device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+    if offset < 0:
+        raise click.UsageError("Option '--offset' must be non-negative.")
+    if limit is not None and limit < 0:
+        raise click.UsageError("Option '--limit' must be non-negative.")
+
+    params: Dict[str, Any] = {"device_id": device_id, "offset": offset}
+    if limit is not None:
+        params["limit"] = limit
+
+    result = run_ipc_call(ctx, "contacts_list", params)
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    contacts_data = result.get("contacts", [])
+    total = result.get("total", len(contacts_data))
+
+    if not contacts_data:
+        console.print(f"[dim]No contacts found for device '{device_id}'.[/]")
+        console.print(f"[dim]Run 'pengulink contacts sync {device_id}' to synchronize contacts from the device.[/]")
+        return
+
+    table = Table(
+        title=f"Contacts for {device_id} (Showing {len(contacts_data)} of {total})",
+        box=box.ROUNDED,
+    )
+    table.add_column("UID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="bold white")
+    table.add_column("Phone Numbers", style="white")
+    table.add_column("Emails", style="white")
+    table.add_column("Organization", style="dim")
+
+    for c in contacts_data:
+        uid = str(c.get("uid", "-"))
+        name = str(c.get("name") or "Unknown Contact")
+        phones_str = format_contact_phones(c.get("phones", []))
+        emails_str = format_contact_emails(c.get("emails", []))
+        org = str(c.get("organization") or "-")
+        table.add_row(uid, name, phones_str, emails_str, org)
+
+    console.print(table)
+
+
+@contacts.command(name="search", help="Search synchronized contacts by name, number, or email.")
+@click.argument("device_id", type=str)
+@click.argument("query", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def contacts_search_cmd(ctx: click.Context, device_id: str, query: str, json_flag: bool) -> None:
+    """Search synchronized contacts by substring query."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    query = query.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+    if not query:
+        raise click.UsageError("Argument 'QUERY' must not be empty.")
+
+    result = run_ipc_call(ctx, "contacts_search", {"device_id": device_id, "query": query})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    matches = result.get("matches", [])
+    if not matches:
+        console.print(f"[dim]No contacts matching '{query}' found for device '{device_id}'.[/]")
+        return
+
+    table = Table(
+        title=f"Search Results for '{query}' on {device_id} ({len(matches)} match(es))",
+        box=box.ROUNDED,
+    )
+    table.add_column("UID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="bold white")
+    table.add_column("Phone Numbers", style="white")
+    table.add_column("Emails", style="white")
+    table.add_column("Organization", style="dim")
+
+    for c in matches:
+        uid = str(c.get("uid", "-"))
+        name = str(c.get("name") or "Unknown Contact")
+        phones_str = format_contact_phones(c.get("phones", []))
+        emails_str = format_contact_emails(c.get("emails", []))
+        org = str(c.get("organization") or "-")
+        table.add_row(uid, name, phones_str, emails_str, org)
+
+    console.print(table)
+
+
+@contacts.command(name="view", help="View detailed contact card or raw vCard.")
+@click.argument("device_id", type=str)
+@click.argument("uid", type=str)
+@click.option("--raw", "-r", is_flag=True, default=False, help="Output verbatim RFC 2426 vCard text.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def contacts_view_cmd(ctx: click.Context, device_id: str, uid: str, raw: bool, json_flag: bool) -> None:
+    """View detailed contact card or raw vCard representation."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    uid = uid.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+    if not uid:
+        raise click.UsageError("Argument 'UID' must not be empty.")
+
+    result = run_ipc_call(ctx, "contacts_get", {"device_id": device_id, "uid": uid})
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    contact = result.get("contact", {})
+    if raw:
+        raw_vcard = contact.get("raw_vcard", "")
+        if not raw_vcard:
+            console.print("[dim]No raw vCard available for this contact record.[/]")
+        else:
+            click.echo(raw_vcard, nl=False)
+        return
+
+    name = contact.get("name") or "Unknown Contact"
+    phones = contact.get("phones", [])
+    emails = contact.get("emails", [])
+    org = contact.get("organization")
+    title = contact.get("title")
+    note = contact.get("note")
+    ts = contact.get("timestamp")
+    cached_at = contact.get("cached_at")
+
+    lines = [f"[bold]UID:[/] [cyan]{uid}[/]"]
+    if org or title:
+        org_display = f"{title} at {org}" if (title and org) else (org or title)
+        lines.append(f"[bold]Organization:[/] {org_display}")
+
+    if phones:
+        lines.append("\n[bold]Phone Numbers:[/]")
+        for p in phones:
+            ptype = p.get("type", "CELL")
+            num = p.get("number", "")
+            norm = p.get("normalized", "")
+            badge = format_phone_type_badge(ptype)
+            norm_str = f" [dim]({norm})[/]" if norm and norm != num else ""
+            lines.append(f"  • {badge} {num}{norm_str}")
+
+    if emails:
+        lines.append("\n[bold]Email Addresses:[/]")
+        for e in emails:
+            etype = e.get("type", "HOME")
+            addr = e.get("email", "")
+            badge = format_email_type_badge(etype)
+            lines.append(f"  • {badge} {addr}")
+
+    if note:
+        lines.append(f"\n[bold]Notes:[/] {note}")
+
+    sub_parts = []
+    if ts and ts > 0:
+        sub_parts.append(f"Remote timestamp: {int(ts)}")
+    if cached_at and cached_at > 0:
+        try:
+            cached_dt = datetime.datetime.fromtimestamp(cached_at).strftime("%Y-%m-%d %H:%M:%S")
+            sub_parts.append(f"Cached at: {cached_dt}")
+        except Exception:
+            pass
+    subtitle = " | ".join(sub_parts) if sub_parts else None
+
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[bold cyan]👤 Contact: {name}[/]",
+            subtitle=subtitle,
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+
+
+@contacts.command(name="sync", help="Synchronize contact address book with target device over TLS.")
+@click.argument("device_id", type=str)
+@click.option("--force", "-f", is_flag=True, default=False, help="Force full synchronization regardless of timestamp manifest.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def contacts_sync_cmd(ctx: click.Context, device_id: str, force: bool, json_flag: bool) -> None:
+    """Synchronize contact address book with target device over active TLS stream."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    result = run_ipc_call(ctx, "contacts_sync", {"device_id": device_id, "force": force}, timeout=60.0)
+
+    if is_json:
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    total = result.get("total", 0)
+    added = result.get("added", 0)
+    updated = result.get("updated", 0)
+    deleted = result.get("deleted", 0)
+    duration = result.get("duration", 0.0)
+
+    summary_text = (
+        f"[bold]Target Device:[/] [bold cyan]{device_id}[/]\n"
+        f"[bold]Total Contacts:[/] [bold white]{total}[/]\n"
+        f"[bold]Changes:[/] [green]+{added} added[/], [yellow]~{updated} updated[/], [red]-{deleted} deleted[/]\n"
+        f"[bold]Duration:[/] [dim]{duration:.2f}s[/]\n\n"
+        "[green]✓ Contact address book successfully synchronized and cached locally.[/]"
+    )
+    console.print(
+        Panel(
+            summary_text,
+            title="[bold green]📇 Contacts Synchronization[/]",
+            border_style="green",
+            box=box.ROUNDED,
+        )
+    )
+
+
+# =====================================================================
+# MPRIS Media Control Commands
+# =====================================================================
+
+def format_time_ms(ms: int) -> str:
+    """Format milliseconds into MM:SS or HH:MM:SS."""
+    if ms < 0:
+        return "--:--"
+    total_seconds = ms // 1000
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_progress_bar(pos_ms: int, length_ms: int, width: int = 24) -> str:
+    """Format position progress bar with percentage."""
+    pos_str = format_time_ms(pos_ms)
+    if length_ms <= 0:
+        bar = "=" * (width // 2) + "-" * (width // 2)
+        return f"{pos_str} [cyan][{bar}][/] (Live / Unknown duration)"
+
+    len_str = format_time_ms(length_ms)
+    ratio = min(1.0, max(0.0, pos_ms / length_ms)) if length_ms > 0 else 0.0
+    pct = int(ratio * 100)
+    filled = int(ratio * width)
+    bar = "=" * max(0, filled - 1) + (">" if 0 < filled < width else "=" if filled == width else "")
+    empty = "-" * (width - len(bar))
+    return f"{pos_str} / {len_str} [cyan][{bar}{empty}][/] {pct}%"
+
+
+def format_volume_bar(volume: int, width: int = 15) -> str:
+    """Format volume percentage and bar."""
+    vol = max(0, min(100, volume))
+    filled = int((vol / 100) * width)
+    empty = width - filled
+    color = "green" if vol > 25 else "yellow" if vol > 10 else "red"
+    return f"{vol}% [{color}][{'━' * filled}{'╸' if empty > 0 else ''}{'─' * max(0, empty - 1)}][/]"
+
+
+def format_playback_badge(is_playing: bool) -> str:
+    """Format playback state badge."""
+    return "[bold green]▶ Playing[/]" if is_playing else "[bold yellow]⏸ Paused[/]"
+
+
+@cli.group(name="mpris", help="Media player control and inspection for connected devices.")
+def mpris() -> None:
+    """Inspect and control remote media players on paired devices."""
+    pass
+
+
+@mpris.command(name="players", help="List available media players on target device.")
+@click.argument("device_id", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_players_cmd(ctx: click.Context, device_id: str, json_flag: bool) -> None:
+    """List available media players on target device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    res = run_ipc_call(ctx, "mpris_list_players", {"device_id": device_id})
+    players = res.get("players", [])
+    active = res.get("active_player")
+
+    if is_json:
+        click.echo(json.dumps(players, indent=2))
+        return
+
+    if not players:
+        console.print(f"No active media players found for device '{escape(device_id)}'.")
+        return
+
+    table = Table(
+        title=f"Media Players on [bold cyan]{escape(device_id)}[/]",
+        box=box.ROUNDED,
+    )
+    table.add_column("Player", style="cyan", no_wrap=True)
+    table.add_column("Status", style="magenta")
+    table.add_column("Active", style="green")
+
+    for p in players:
+        is_act = "✓" if p == active else ""
+        table.add_row(escape(p), "Available", is_act)
+
+    console.print(table)
+
+
+@mpris.command(name="status", help="Get media playback status and track metadata.")
+@click.argument("device_id", type=str)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_status_cmd(ctx: click.Context, device_id: str, player: Optional[str], json_flag: bool) -> None:
+    """Get media playback status and track metadata for active or selected player."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    params: Dict[str, Any] = {"device_id": device_id}
+    if player:
+        params["player"] = player.strip()
+
+    res = run_ipc_call(ctx, "mpris_get_status", params)
+    status = res.get("status")
+
+    if is_json:
+        click.echo(json.dumps(status or {}, indent=2))
+        return
+
+    if not status:
+        console.print(f"No media player status available for device '{escape(device_id)}'.")
+        return
+
+    player_name = status.get("player") or "Unknown Player"
+    safe_player = escape(player_name)
+    safe_title = escape(status.get("title") or "Unknown Title")
+    safe_artist = escape(status.get("artist") or "Unknown Artist")
+    safe_album = escape(status.get("album") or "Unknown Album")
+    is_playing = bool(status.get("isPlaying", False))
+    pos = int(status.get("pos", 0))
+    length = int(status.get("length", -1))
+    vol = int(status.get("volume", 100))
+    loop = escape(status.get("loopStatus") or "None")
+    shuf = "On" if status.get("shuffle") else "Off"
+
+    lines = [
+        f"  {format_playback_badge(is_playing)}",
+        "",
+        f"  [bold]Title:[/]    {safe_title}",
+        f"  [bold]Artist:[/]   {safe_artist}",
+        f"  [bold]Album:[/]    {safe_album}",
+        "",
+        f"  [bold]Progress:[/] {format_progress_bar(pos, length)}",
+        f"  [bold]Volume:[/]   {format_volume_bar(vol)}",
+        "",
+        "  [bold]Controls:[/] [bold cyan]⏪ Prev[/]  [bold cyan]⏩ Next[/]  [bold cyan]🔍 Seek[/]",
+        f"  [bold]Loop:[/]     [dim]{loop}[/]     [bold]Shuffle:[/] [dim]{shuf}[/]",
+    ]
+
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title=f"[bold cyan]🎵 Media Status: {safe_player} on {escape(device_id)}[/]",
+            border_style="cyan",
+            box=box.ROUNDED,
+        )
+    )
+
+
+def _handle_transport_cmd(
+    ctx: click.Context,
+    device_id: str,
+    action: str,
+    player: Optional[str],
+    json_flag: bool,
+) -> None:
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    params: Dict[str, Any] = {"device_id": device_id, "action": action}
+    if player:
+        params["player"] = player.strip()
+
+    res = run_ipc_call(ctx, "mpris_send_action", params)
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    safe_p = escape(res.get("player") or "player")
+    console.print(f"[green]✓ Action '{escape(action)}' sent to {safe_p} on '{escape(device_id)}'.[/]")
+
+
+@mpris.command(name="play", help="Resume or start playback.")
+@click.argument("device_id", type=str)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_play_cmd(ctx: click.Context, device_id: str, player: Optional[str], json_flag: bool) -> None:
+    """Send Play action to media player."""
+    _handle_transport_cmd(ctx, device_id, "Play", player, json_flag)
+
+
+@mpris.command(name="pause", help="Pause playback.")
+@click.argument("device_id", type=str)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_pause_cmd(ctx: click.Context, device_id: str, player: Optional[str], json_flag: bool) -> None:
+    """Send Pause action to media player."""
+    _handle_transport_cmd(ctx, device_id, "Pause", player, json_flag)
+
+
+@mpris.command(name="play-pause", help="Toggle play/pause state.")
+@click.argument("device_id", type=str)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_play_pause_cmd(ctx: click.Context, device_id: str, player: Optional[str], json_flag: bool) -> None:
+    """Toggle PlayPause state on media player."""
+    _handle_transport_cmd(ctx, device_id, "PlayPause", player, json_flag)
+
+
+@mpris.command(name="next", help="Skip to next track.")
+@click.argument("device_id", type=str)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_next_cmd(ctx: click.Context, device_id: str, player: Optional[str], json_flag: bool) -> None:
+    """Skip to next track."""
+    _handle_transport_cmd(ctx, device_id, "Next", player, json_flag)
+
+
+@mpris.command(name="previous", help="Skip to previous track.")
+@click.argument("device_id", type=str)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_previous_cmd(ctx: click.Context, device_id: str, player: Optional[str], json_flag: bool) -> None:
+    """Skip to previous track."""
+    _handle_transport_cmd(ctx, device_id, "Previous", player, json_flag)
+
+
+@mpris.command(name="stop", help="Stop playback.")
+@click.argument("device_id", type=str)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_stop_cmd(ctx: click.Context, device_id: str, player: Optional[str], json_flag: bool) -> None:
+    """Stop playback."""
+    _handle_transport_cmd(ctx, device_id, "Stop", player, json_flag)
+
+
+@mpris.command(name="volume", help="Set player volume percentage (0..100).")
+@click.argument("device_id", type=str)
+@click.argument("volume", type=int)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_volume_cmd(ctx: click.Context, device_id: str, volume: int, player: Optional[str], json_flag: bool) -> None:
+    """Set volume percentage (0..100) on target player."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    if volume < 0 or volume > 100:
+        raise click.BadParameter("Volume must be between 0 and 100", param_hint="VOLUME")
+
+    params: Dict[str, Any] = {"device_id": device_id, "volume": volume}
+    if player:
+        params["player"] = player.strip()
+
+    res = run_ipc_call(ctx, "mpris_set_volume", params)
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    safe_p = escape(res.get("player") or "player")
+    console.print(f"[green]✓ Volume set to {volume}% on {safe_p} ({escape(device_id)}).[/]")
+
+
+@mpris.command(name="seek", help="Seek track position by offset in milliseconds (positive or negative).")
+@click.argument("device_id", type=str)
+@click.argument("offset_ms", type=int)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_seek_cmd(ctx: click.Context, device_id: str, offset_ms: int, player: Optional[str], json_flag: bool) -> None:
+    """Seek relative track position in milliseconds."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    params: Dict[str, Any] = {"device_id": device_id, "offset_ms": offset_ms}
+    if player:
+        params["player"] = player.strip()
+
+    res = run_ipc_call(ctx, "mpris_seek", params)
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    safe_p = escape(res.get("player") or "player")
+    console.print(f"[green]✓ Seek {offset_ms:+d}ms sent to {safe_p} ({escape(device_id)}).[/]")
+
+
+@mpris.command(name="position", help="Set absolute track position in milliseconds.")
+@click.argument("device_id", type=str)
+@click.argument("position_ms", type=int)
+@click.option("--player", "-p", type=str, default=None, help="Target player name.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def mpris_position_cmd(ctx: click.Context, device_id: str, position_ms: int, player: Optional[str], json_flag: bool) -> None:
+    """Set absolute track position in milliseconds."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    if position_ms < 0:
+        raise click.BadParameter("Position must be non-negative", param_hint="POSITION_MS")
+
+    params: Dict[str, Any] = {"device_id": device_id, "position_ms": position_ms}
+    if player:
+        params["player"] = player.strip()
+
+    res = run_ipc_call(ctx, "mpris_set_position", params)
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    safe_p = escape(res.get("player") or "player")
+    console.print(f"[green]✓ Position set to {position_ms}ms on {safe_p} ({escape(device_id)}).[/]")
+
+
+# =====================================================================
+# Remote Commands CLI (Milestone 15)
+# =====================================================================
+
+@cli.group(name="command", help="Discover and trigger commands configured on remote devices.")
+def command_group() -> None:
+    """Inspect and trigger commands configured on remote paired devices."""
+    pass
+
+
+@command_group.command(name="list", help="List available remote commands on target device.")
+@click.argument("device_id", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def command_list_cmd(ctx: click.Context, device_id: str, json_flag: bool) -> None:
+    """List available remote commands on target device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip() if device_id else ""
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    params: Dict[str, Any] = {"device_id": device_id}
+    res = run_ipc_call(ctx, "list_remote_commands", params)
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    commands = res if isinstance(res, list) else []
+    if not commands:
+        console.print(f"[yellow]No remote commands available for device '[bold]{escape(device_id)}[/]'.[/]")
+        return
+
+    table = Table(
+        title=f"Remote Commands — {escape(device_id)}",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+    )
+    table.add_column("Key", style="cyan", no_wrap=True)
+    table.add_column("Name", style="bold white")
+    table.add_column("Command", style="dim")
+
+    for cmd in commands:
+        k = escape(str(cmd.get("key", "")))
+        n = escape(str(cmd.get("name", "")))
+        c = str(cmd.get("command", "") or "")
+        c_display = escape(c) if c else "[dim]\\[hidden][/]"
+        table.add_row(k, n, c_display)
+
+    console.print(table)
+
+
+@command_group.command(name="exec", help="Trigger execution of a configured remote command.")
+@click.argument("device_id", type=str)
+@click.argument("key", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def command_exec_cmd(ctx: click.Context, device_id: str, key: str, json_flag: bool) -> None:
+    """Trigger execution of a configured remote command on target device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id.strip() if device_id else ""
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+    key = key.strip() if key else ""
+    if not key:
+        raise click.UsageError("Argument 'KEY' must not be empty.")
+
+    params: Dict[str, Any] = {"device_id": device_id, "key": key}
+    res = run_ipc_call(ctx, "execute_remote_command", params)
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    safe_did = escape(device_id)
+    safe_key = escape(key)
+    panel_text = f"[bold green]✓[/] Execution request for command '[bold cyan]{safe_key}[/]' transmitted to device '[bold]{safe_did}[/]'."
+    console.print(Panel(panel_text, title="Remote Command Executed", border_style="green"))
+
+
+@command_group.command(name="run", help="Alias for 'exec': Trigger execution of a configured remote command.")
+@click.argument("device_id", type=str)
+@click.argument("key", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def command_run_cmd(ctx: click.Context, device_id: str, key: str, json_flag: bool) -> None:
+    """Alias for exec: Trigger execution of a configured remote command on target device."""
+    ctx.invoke(command_exec_cmd, device_id=device_id, key=key, json_flag=json_flag)
+
+
 if __name__ == "__main__":
     cli()
+
 

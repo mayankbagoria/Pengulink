@@ -19,6 +19,7 @@ from pengulink.plugins.findmyphone import (
 )
 from pengulink.plugins.notification import NotificationPlugin
 from pengulink.plugins.ping import PingPlugin
+from pengulink.plugins.remotecommands import RemoteCommand, RemoteCommandsPlugin
 from pengulink.plugins.share import SharePlugin
 
 __all__ = [
@@ -34,5 +35,7 @@ __all__ = [
     "FindMyPhonePlugin",
     "create_find_my_phone_request_packet",
     "SharePlugin",
+    "RemoteCommand",
+    "RemoteCommandsPlugin",
 ]
 

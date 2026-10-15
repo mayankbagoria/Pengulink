@@ -334,6 +334,26 @@ class PluginInitializationError(PluginError):
 
 
 # =====================================================================
+# Contacts Exceptions
+# =====================================================================
+
+class ContactsError(PluginError):
+    """Base exception for contacts synchronization and vCard handling."""
+
+
+class ContactNotFoundError(ContactsError):
+    """Raised when a requested contact UID is not found for a device."""
+
+
+class SyncTimeoutError(ContactsError, ConnectionTimeoutError):
+    """Raised when contact synchronization packet exchange times out."""
+
+
+ContactsSyncError = ContactsError
+ContactsTimeoutError = SyncTimeoutError
+
+
+# =====================================================================
 # Daemon & IPC Exceptions
 # =====================================================================
 
@@ -409,6 +429,52 @@ class PayloadTimeoutError(PayloadTransferError, ConnectionTimeoutError):
     """Raised when peer connection or socket I/O times out during payload transfer."""
 
 
+# =====================================================================
+# MPRIS Exceptions
+# =====================================================================
+
+class MprisError(PluginError):
+    """Base exception for media control subsystem and MPRIS operations."""
+
+
+class MprisAdapterError(MprisError):
+    """Raised when an MPRIS host adapter encounters an operational error."""
+
+
+class MprisAdapterUnavailableError(MprisAdapterError):
+    """Raised when a requested MPRIS host adapter is not functional in current environment."""
+
+
+class MprisPlayerNotFoundError(MprisError):
+    """Raised when targeted media player does not exist or is not registered."""
+
+
+PlayerNotFoundError = MprisPlayerNotFoundError
+
+
+class ActionUnsupportedError(MprisError):
+    """Raised when a media transport action cannot be executed or is unsupported."""
+
+
+MprisActionError = ActionUnsupportedError
+
+
+class MprisPayloadError(MprisError):
+    """Raised when out-of-band album art payload transfer fails."""
+
+
+# =====================================================================
+# Remote Commands Exceptions (Milestone 15)
+# =====================================================================
+
+class RemoteCommandError(PluginError):
+    """Base exception for RemoteCommands plugin errors."""
+
+
+class RemoteCommandNotFoundError(RemoteCommandError):
+    """Raised when a specified remote command key is not found on the device."""
+
+
 __all__ = [
     "PenguLinkError",
     "ConfigError",
@@ -454,6 +520,11 @@ __all__ = [
     "PluginError",
     "PluginNotFoundError",
     "PluginInitializationError",
+    "ContactsError",
+    "ContactNotFoundError",
+    "SyncTimeoutError",
+    "ContactsSyncError",
+    "ContactsTimeoutError",
     "DaemonError",
     "IPCError",
     "DaemonAlreadyRunningError",
@@ -470,5 +541,16 @@ __all__ = [
     "PayloadTransferError",
     "PayloadPortBindingError",
     "PayloadTimeoutError",
+    "MprisError",
+    "MprisAdapterError",
+    "MprisAdapterUnavailableError",
+    "MprisPlayerNotFoundError",
+    "PlayerNotFoundError",
+    "ActionUnsupportedError",
+    "MprisActionError",
+    "MprisPayloadError",
+    "RemoteCommandError",
+    "RemoteCommandNotFoundError",
 ]
+
 

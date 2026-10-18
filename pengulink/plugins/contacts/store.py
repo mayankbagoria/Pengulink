@@ -15,10 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, TypeVar
 
-from pengulink.core.exceptions import StorageError, StorageWriteError
+from pengulink.core.exceptions import PathTraversalError, StorageError, StorageWriteError
 from pengulink.plugins.contacts.vcard import Contact
 
 logger = logging.getLogger("pengulink.plugins.contacts.store")
+
+_DEVICE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 T = TypeVar("T")
 
@@ -70,7 +72,12 @@ class ContactStore:
         return self._locks[device_id]
 
     def _get_device_file(self, device_id: str) -> Path:
-        return self.contacts_dir / f"{device_id}.json"
+        if not device_id or not _DEVICE_ID_RE.match(device_id):
+            raise PathTraversalError(f"Invalid device_id '{device_id}' contains forbidden characters")
+        file_path = self.contacts_dir / f"{device_id}.json"
+        if not file_path.resolve().is_relative_to(self.contacts_dir.resolve()):
+            raise PathTraversalError(f"Target path '{file_path}' escapes contacts directory")
+        return file_path
 
     async def load_device(self, device_id: str) -> Tuple[Dict[str, int], Dict[str, Contact]]:
         """Load manifest and contacts from in-memory cache or disk."""

@@ -95,7 +95,7 @@ class Packet(BaseModel):
     type: str = Field(..., description="KDE Connect packet type")
     body: Dict[str, Any] = Field(default_factory=dict, description="Plugin-specific payload object")
     payloadSize: Optional[int] = Field(
-        default=None, description="Attached binary payload size in bytes"
+        default=None, ge=0, description="Attached binary payload size in bytes"
     )
     payloadTransferInfo: Optional[Dict[str, Any]] = Field(
         default=None, description="Attached binary payload connection parameters"
@@ -120,6 +120,15 @@ class Packet(BaseModel):
         if not isinstance(v, str) or not PACKET_TYPE_REGEX.match(v):
             raise InvalidPacketSchemaError(
                 f"Invalid packet type: {v!r}. Must match regex {PACKET_TYPE_REGEX.pattern}."
+            )
+        return v
+
+    @field_validator("payloadSize")
+    @classmethod
+    def validate_payload_size(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v < 0:
+            raise ValueError(
+                f"Invalid packet payloadSize: {v!r}. Must be a non-negative integer."
             )
         return v
 
@@ -242,14 +251,78 @@ class PacketEngine:
 
 class StreamLineReader:
     """Asynchronous line reader wrapping asyncio.StreamReader with strict
-
-    buffer overrun guards against CVE-2020-26164.
+    buffer overrun guards against CVE-2020-26164 and empty line flood protection.
     """
 
-    def __init__(self, reader: asyncio.StreamReader, max_consecutive_errors: int = 5) -> None:
-        self._reader = reader
+    def __init__(
+        self,
+        reader: Optional[asyncio.StreamReader] = None,
+        max_consecutive_errors: int = 5,
+        max_consecutive_empty_lines: int = 50,
+    ) -> None:
+        self._reader: asyncio.StreamReader = reader if reader is not None else asyncio.StreamReader()
         self._max_consecutive_errors = max_consecutive_errors
         self._consecutive_errors = 0
+        self._max_consecutive_empty_lines = max_consecutive_empty_lines
+        self._consecutive_empty_lines = 0
+
+    def feed_data(self, data: bytes) -> None:
+        """Feed raw bytes to internal StreamReader buffer."""
+        self._reader.feed_data(data)
+
+    def feed_eof(self) -> None:
+        """Signal EOF to internal StreamReader."""
+        self._reader.feed_eof()
+
+    async def read_line(self) -> bytes:
+        """Reads a single line from stream with truncation detection and blank line flood defense.
+
+        Raises:
+            PacketBufferOverrunError: On buffer overrun (>128 KB without newline).
+            TruncatedPacketError: If EOF is reached without terminating newline.
+            PacketFramingError: If consecutive empty lines exceed threshold.
+        """
+        try:
+            line = await self._reader.readline()
+        except (asyncio.LimitOverrunError, ValueError) as exc:
+            is_overrun = isinstance(exc, asyncio.LimitOverrunError) or (
+                "exceed the limit" in str(exc).lower()
+                or "separator is not found" in str(exc).lower()
+            )
+            if is_overrun:
+                if hasattr(self._reader, "_buffer"):
+                    self._reader._buffer.clear()
+                logger.error(
+                    "SECURITY ALERT: Buffer overrun detected (>%d bytes). "
+                    "Terminating connection to mitigate CVE-2020-26164.",
+                    MAX_PACKET_SIZE,
+                )
+                raise PacketBufferOverrunError(
+                    f"Stream buffer overrun exceeded {MAX_PACKET_SIZE} bytes without newline."
+                ) from exc
+            raise
+
+        if not line:
+            return b""
+
+        if not line.endswith(b"\n"):
+            logger.warning("Truncated line received at stream EOF (%d bytes).", len(line))
+            raise TruncatedPacketError(f"Incomplete packet frame: EOF reached without newline ({len(line)} bytes).")
+
+        if line in (b"\n", b"\r\n") or not line.strip():
+            self._consecutive_empty_lines += 1
+            if self._consecutive_empty_lines > self._max_consecutive_empty_lines:
+                logger.error(
+                    "SECURITY ALERT: Empty line flood detected: exceeded %d consecutive blank lines.",
+                    self._max_consecutive_empty_lines,
+                )
+                raise PacketFramingError(
+                    f"Empty line flood detected: exceeded {self._max_consecutive_empty_lines} consecutive blank lines."
+                )
+            return line
+
+        self._consecutive_empty_lines = 0
+        return line
 
     async def read_packet(self) -> Optional[Packet]:
         """Reads next complete packet from the stream.
@@ -262,42 +335,15 @@ class StreamLineReader:
             PacketBufferOverrunError: On buffer overrun (>128 KB without newline).
             MalformedPacketError: If consecutive parsing error threshold is reached.
             TruncatedPacketError: If EOF is reached without terminating newline.
+            PacketFramingError: If consecutive empty lines exceed threshold.
         """
         while True:
-            try:
-                line = await self._reader.readline()
-            except (asyncio.LimitOverrunError, ValueError) as exc:
-                # Handle Python 3.14 dual exception behavior for limit overrun
-                is_overrun = isinstance(exc, asyncio.LimitOverrunError) or (
-                    "exceed the limit" in str(exc).lower()
-                    or "separator is not found" in str(exc).lower()
-                )
-                if is_overrun:
-                    # Clean internal reader buffer to prevent memory exhaustion
-                    if hasattr(self._reader, "_buffer"):
-                        self._reader._buffer.clear()
-                    logger.error(
-                        "SECURITY ALERT: Buffer overrun detected (>%d bytes). "
-                        "Terminating connection to mitigate CVE-2020-26164.",
-                        MAX_PACKET_SIZE,
-                    )
-                    raise PacketBufferOverrunError(
-                        f"Stream buffer overrun exceeded {MAX_PACKET_SIZE} bytes without newline."
-                    ) from exc
-                raise
-
-            # Detect clean EOF
+            line = await self.read_line()
             if not line:
                 return None
 
-            # Skip empty lines (blank newlines)
-            if not line.strip():
+            if line in (b"\n", b"\r\n") or not line.strip():
                 continue
-
-            # Check if line was truncated at EOF (missing terminating newline)
-            if not line.endswith(b"\n"):
-                logger.warning("Truncated line received at stream EOF (%d bytes).", len(line))
-                raise TruncatedPacketError("Stream reached EOF before newline was received.")
 
             packet = PacketEngine.parse_safe(line)
             if packet is not None:
@@ -309,6 +355,7 @@ class StreamLineReader:
                 raise MalformedPacketError(
                     f"Exceeded maximum allowable consecutive malformed packets ({self._max_consecutive_errors})."
                 )
+
 
     async def stream_packets(self) -> AsyncIterator[Packet]:
         """Asynchronous generator yielding packets until EOF or fatal error."""

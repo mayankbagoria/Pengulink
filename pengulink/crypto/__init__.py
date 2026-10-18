@@ -17,6 +17,7 @@ from pengulink.crypto.certificate import (
     load_credentials,
     load_private_key_pem,
     save_credentials,
+    save_private_key,
 )
 from pengulink.crypto.pairing import (
     PairingSession,
@@ -27,6 +28,7 @@ from pengulink.crypto.pairing import (
 from pengulink.crypto.tls import (
     create_paired_ssl_context,
     create_tofu_ssl_context,
+    ephemeral_tls_credentials,
     verify_peer_certificate,
 )
 
@@ -41,11 +43,13 @@ __all__ = [
     "dump_certificate_pem",
     "load_certificate_pem",
     "save_credentials",
+    "save_private_key",
     "load_credentials",
     "ensure_credentials",
     # TLS
     "create_paired_ssl_context",
     "create_tofu_ssl_context",
+    "ephemeral_tls_credentials",
     "verify_peer_certificate",
     # Pairing
     "create_pair_packet",

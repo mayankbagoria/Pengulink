@@ -504,11 +504,11 @@ class TestTimestampMonotonicityAndClockSkew:
         engine = LoopSuppressionEngine()
         now_ms = engine.current_wall_ms()
 
-        # Skewed peer advances local clock by +12 hours
+        # Skewed peer attempts to advance local clock by +12 hours, but CLUS-27 clamps to max_future_drift_ms
         engine.record_inbound_accepted("skewed-text", now_ms + 12 * 3600 * 1000)
-        assert engine.local_timestamp == now_ms + 12 * 3600 * 1000
+        assert engine.local_timestamp == now_ms + engine.max_future_drift_ms
 
-        # Normal peer sends packet with current time -> REJECTED as stale
+        # Normal peer sends packet with current time -> REJECTED as stale within the 15s window
         accepted, reason = engine.evaluate_inbound("normal-text", now_ms + 5000, "normal-peer")
         assert accepted is False
         assert "stale_timestamp" in reason

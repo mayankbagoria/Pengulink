@@ -6,6 +6,7 @@ deterministic collision resolution, and atomic staging for PenguLink Share.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
@@ -16,7 +17,7 @@ import time
 import unicodedata
 import uuid
 from pathlib import Path
-from typing import Any, IO, Optional, Tuple, Union
+from typing import Any, IO, Optional, Set, Tuple, Union
 
 from pengulink.core.exceptions import (
     DestinationDirectoryError,
@@ -135,10 +136,11 @@ def resolve_download_dir(
         try:
             resolved = cand.resolve()
             resolved.mkdir(parents=True, exist_ok=True, mode=POSIX_DIR_MODE)
-            try:
-                os.chmod(resolved, POSIX_DIR_MODE)
-            except OSError:
-                pass
+            if resolved != Path.home().resolve():
+                try:
+                    os.chmod(resolved, POSIX_DIR_MODE)
+                except OSError:
+                    pass
             if os.access(resolved, os.W_OK):
                 return resolved
         except Exception as exc:
@@ -149,6 +151,31 @@ def resolve_download_dir(
         f"Failed to resolve or create a writable download directory: {last_error}",
         context={"candidates": [str(c) for c in candidates_to_try if c is not None]},
     )
+
+
+def ensure_destination_directory(
+    candidates_or_override: Optional[Union[List[Union[str, Path]], str, Path]] = None,
+    config: Optional[Any] = None,
+) -> Path:
+    """Ensure a destination directory from candidates or standard resolution, sparing Path.home() from chmod 0700."""
+    if isinstance(candidates_or_override, list):
+        for cand in candidates_or_override:
+            p = Path(cand).expanduser()
+            try:
+                resolved = p.resolve()
+                resolved.mkdir(parents=True, exist_ok=True, mode=POSIX_DIR_MODE)
+                if resolved != Path.home().resolve():
+                    try:
+                        os.chmod(resolved, POSIX_DIR_MODE)
+                    except OSError:
+                        pass
+                if os.access(resolved, os.W_OK):
+                    return resolved
+            except Exception:
+                continue
+        raise DestinationDirectoryError("None of the candidate destination directories could be created or written to")
+    return resolve_download_dir(dest_override=candidates_or_override, config=config)
+
 
 
 def split_stem_and_suffix(filename: str) -> Tuple[str, str]:
@@ -236,6 +263,20 @@ def sanitize_filename(raw_filename: str, max_bytes: int = MAX_FILENAME_BYTES) ->
             truncated_stem = stem_bytes[:max_stem_bytes].decode("utf-8", errors="ignore")
             cleaned = f"{truncated_stem}{suffix}"
 
+    # Re-enforce leading dot defense post byte-clamping
+    if cleaned.startswith("."):
+        cleaned = f"file_{cleaned}"
+        encoded = cleaned.encode("utf-8")
+        if len(encoded) > max_bytes:
+            cleaned = encoded[:max_bytes].decode("utf-8", errors="ignore")
+            if cleaned.startswith("."):
+                cleaned = f"file_{cleaned.lstrip('.')}"
+
+    if cleaned.startswith("."):
+        cleaned = f"file_{cleaned.lstrip('.')}"
+    if not cleaned:
+        cleaned = "file"
+
     return cleaned
 
 
@@ -272,32 +313,57 @@ def verify_boundary(dest_dir: Path, target_path: Path) -> Path:
 validate_containment = verify_boundary
 
 
-def resolve_collision(dest_dir: Path, filename: str) -> Path:
+def resolve_collision(
+    dest_dir: Path,
+    filename: str,
+    reserved_paths: Optional[Set[Path]] = None,
+) -> Path:
     """Deterministically resolve filename collision using 'stem (counter).suffix' up to 10,000."""
     dest_dir = dest_dir.resolve()
     stem, suffix = split_stem_and_suffix(filename)
 
     initial_candidate = dest_dir / f"{stem}{suffix}"
-    if not initial_candidate.exists() and not initial_candidate.is_symlink():
+    if (
+        not initial_candidate.exists()
+        and not initial_candidate.is_symlink()
+        and (reserved_paths is None or initial_candidate not in reserved_paths)
+    ):
         return initial_candidate
 
     for counter in range(1, MAX_COLLISION_ATTEMPTS + 1):
         candidate = dest_dir / f"{stem} ({counter}){suffix}"
-        if not candidate.exists() and not candidate.is_symlink():
+        if (
+            not candidate.exists()
+            and not candidate.is_symlink()
+            and (reserved_paths is None or candidate not in reserved_paths)
+        ):
             return candidate
 
     # Fallback if 10,000 collisions exist: append 8-char hex UUID
-    random_suffix = uuid.uuid4().hex[:8]
-    return dest_dir / f"{stem}_{random_suffix}{suffix}"
+    while True:
+        random_suffix = uuid.uuid4().hex[:8]
+        candidate = dest_dir / f"{stem}_{random_suffix}{suffix}"
+        if (
+            not candidate.exists()
+            and not candidate.is_symlink()
+            and (reserved_paths is None or candidate not in reserved_paths)
+        ):
+            return candidate
 
 
 def strip_execution_bits(path: Path) -> None:
-    """Enforce POSIX 0644 non-executable permissions."""
+    """Enforce POSIX 0644 non-executable permissions, safely ignoring symlinks."""
     try:
-        current_mode = os.stat(path).st_mode
+        st = os.stat(path, follow_symlinks=False)
+        if stat.S_ISLNK(st.st_mode):
+            return
+        current_mode = st.st_mode
         # Clear execute bits and non-owner write bits: exact 0o644 mode
         new_mode = (current_mode & ~0o777) | POSIX_FILE_MODE
-        os.chmod(path, new_mode)
+        try:
+            os.chmod(path, new_mode, follow_symlinks=False)
+        except (NotImplementedError, TypeError, OSError):
+            os.chmod(path, new_mode)
     except OSError:
         pass
 
@@ -381,7 +447,7 @@ class AtomicFileStager:
 
     # Async-compatible methods for stream writers
     async def write_chunk(self, chunk: bytes) -> int:
-        return self.write(chunk)
+        return await asyncio.to_thread(self.write, chunk)
 
     def close(self) -> None:
         if self._file_obj is not None:
@@ -450,6 +516,7 @@ __all__ = [
     "COMPOUND_EXTENSIONS",
     "parse_xdg_user_dirs_file",
     "resolve_download_dir",
+    "ensure_destination_directory",
     "split_stem_and_suffix",
     "sanitize_filename",
     "verify_boundary",

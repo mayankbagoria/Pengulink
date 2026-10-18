@@ -11,9 +11,14 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
-from pengulink.core.events import EventBus, NotificationCleared, NotificationReceived
+from pengulink.core.events import (
+    DeviceUnpaired,
+    EventBus,
+    NotificationCleared,
+    NotificationReceived,
+)
 from pengulink.network.packet import Packet
 from pengulink.plugins.base import Plugin, SendPacketCallable, safe_send_packet
 
@@ -81,8 +86,25 @@ class NotificationPlugin(Plugin):
 
     def __init__(self, event_bus: Optional[EventBus] = None) -> None:
         super().__init__(event_bus)
-        # Mapping: notification_id -> StoredNotification
-        self._active_notifications: Dict[str, StoredNotification] = {}
+        # Mapping: (device_id, notification_id) -> StoredNotification
+        self._active_notifications: Dict[Tuple[str, str], StoredNotification] = {}
+        self._unsub_unpair: Optional[Callable[[], None]] = None
+
+    async def start(self) -> None:
+        await super().start()
+        if self.event_bus:
+            self._unsub_unpair = self.event_bus.subscribe(DeviceUnpaired, self._on_device_unpaired)
+
+    async def stop(self) -> None:
+        if self._unsub_unpair:
+            self._unsub_unpair()
+            self._unsub_unpair = None
+        await super().stop()
+
+    def _on_device_unpaired(self, event: DeviceUnpaired) -> None:
+        keys_to_remove = [k for k in self._active_notifications if k[0] == event.device_id]
+        for k in keys_to_remove:
+            self._active_notifications.pop(k, None)
 
     @property
     def plugin_id(self) -> str:
@@ -100,10 +122,22 @@ class NotificationPlugin(Plugin):
             NOTIFICATION_REPLY_TYPE,
         ]
 
-    def get_notification(self, notification_id: str) -> Optional[StoredNotification]:
-        return self._active_notifications.get(notification_id)
+    def get_notification(
+        self,
+        notification_id: str,
+        device_id: Optional[str] = None,
+    ) -> Optional[StoredNotification]:
+        clean_id = sanitize_notification_id(notification_id)
+        if device_id is not None:
+            return self._active_notifications.get((device_id, clean_id))
+        for (d_id, n_id), stored in self._active_notifications.items():
+            if n_id == clean_id:
+                return stored
+        return None
 
-    def list_notifications(self) -> List[StoredNotification]:
+    def list_notifications(self, device_id: Optional[str] = None) -> List[StoredNotification]:
+        if device_id is not None:
+            return [n for (d_id, _), n in self._active_notifications.items() if d_id == device_id]
         return list(self._active_notifications.values())
 
     async def handle_packet(
@@ -127,7 +161,7 @@ class NotificationPlugin(Plugin):
         # Check for remote cancellation
         if body.get("isCancel") is True:
             logger.debug("Remote notification %s cleared on device %s", notification_id, device_id)
-            self._active_notifications.pop(notification_id, None)
+            self._active_notifications.pop((device_id, notification_id), None)
             if self.event_bus:
                 await self.event_bus.publish(
                     NotificationCleared(
@@ -167,7 +201,7 @@ class NotificationPlugin(Plugin):
             request_reply_id=str(request_reply_id) if request_reply_id else None,
             auth_code=auth_code,
         )
-        self._active_notifications[notification_id] = stored
+        self._active_notifications[(device_id, notification_id)] = stored
 
         logger.info(
             "Notification from %s [%s]: '%s' - '%s'%s",
@@ -201,6 +235,7 @@ class NotificationPlugin(Plugin):
         self,
         send_packet: SendPacketCallable,
         notification_id: str,
+        device_id: Optional[str] = None,
     ) -> Packet:
         """Send a dismissal request to the remote device and clear from local cache."""
         clean_id = sanitize_notification_id(notification_id)
@@ -211,7 +246,18 @@ class NotificationPlugin(Plugin):
         await safe_send_packet(send_packet, packet)
 
         # Optimistically clear from local cache
-        stored = self._active_notifications.pop(clean_id, None)
+        stored: Optional[StoredNotification] = None
+        if device_id is not None:
+            stored = self._active_notifications.pop((device_id, clean_id), None)
+        else:
+            target_key = None
+            for (d_id, n_id) in self._active_notifications:
+                if n_id == clean_id:
+                    target_key = (d_id, n_id)
+                    break
+            if target_key:
+                stored = self._active_notifications.pop(target_key, None)
+
         if stored and self.event_bus:
             await self.event_bus.publish(
                 NotificationCleared(

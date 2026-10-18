@@ -458,22 +458,26 @@ class DBusMprisAdapter(MprisHostAdapter):
     async def list_players(self) -> List[str]:
         if not self._running or not self._bus:
             return []
-        try:
-            import dbus  # type: ignore[import-untyped]
-            dbus_obj = self._bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus")
-            dbus_iface = dbus.Interface(dbus_obj, "org.freedesktop.DBus")
-            services = dbus_iface.ListNames()
-            players = []
-            for s in services:
-                name_str = str(s)
-                if name_str.startswith("org.mpris.MediaPlayer2.") and not self.should_ignore_service(name_str):
-                    # Strip prefix to get human-readable player name
-                    clean_name = name_str[len("org.mpris.MediaPlayer2."):]
-                    players.append(clean_name)
-            return sorted(players)
-        except Exception as exc:
-            logger.warning("Error listing D-Bus MPRIS players: %s", exc)
-            return []
+
+        def _do_list() -> List[str]:
+            try:
+                import dbus  # type: ignore[import-untyped]
+                dbus_obj = self._bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus")
+                dbus_iface = dbus.Interface(dbus_obj, "org.freedesktop.DBus")
+                services = dbus_iface.ListNames()
+                players = []
+                for s in services:
+                    name_str = str(s)
+                    if name_str.startswith("org.mpris.MediaPlayer2.") and not self.should_ignore_service(name_str):
+                        # Strip prefix to get human-readable player name
+                        clean_name = name_str[len("org.mpris.MediaPlayer2."):]
+                        players.append(clean_name)
+                return sorted(players)
+            except Exception as exc:
+                logger.warning("Error listing D-Bus MPRIS players: %s", exc)
+                return []
+
+        return await asyncio.to_thread(_do_list)
 
     async def get_player_status(self, player: str) -> Optional[PlayerState]:
         if not self._running or not self._bus:
@@ -481,57 +485,79 @@ class DBusMprisAdapter(MprisHostAdapter):
         bus_name = f"org.mpris.MediaPlayer2.{player}"
         if self.should_ignore_service(bus_name):
             return None
-        try:
-            import dbus  # type: ignore[import-untyped]
-            player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
-            props_iface = dbus.Interface(player_obj, "org.freedesktop.DBus.Properties")
 
-            playback_status = str(props_iface.Get("org.mpris.MediaPlayer2.Player", "PlaybackStatus"))
-            is_playing = (playback_status.lower() == "playing")
+        def _do_get_status() -> Optional[PlayerState]:
+            try:
+                import dbus  # type: ignore[import-untyped]
+                player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
+                props_iface = dbus.Interface(player_obj, "org.freedesktop.DBus.Properties")
 
-            metadata = props_iface.Get("org.mpris.MediaPlayer2.Player", "Metadata")
-            title = str(metadata.get("xesam:title", ""))
-            artist_raw = metadata.get("xesam:artist", [])
-            artist = ", ".join(str(a) for a in artist_raw) if isinstance(artist_raw, (list, tuple)) else str(artist_raw or "")
-            album = str(metadata.get("xesam:album", ""))
-            art_url = str(metadata.get("mpris:artUrl", ""))
-            length_us = int(metadata.get("mpris:length", -1))
-            url = str(metadata.get("xesam:url", ""))
+                try:
+                    props = props_iface.GetAll("org.mpris.MediaPlayer2.Player")
+                except Exception as getall_exc:
+                    logger.debug("GetAll failed for '%s', falling back gracefully: %s", player, getall_exc)
+                    props = {}
 
-            pos_us = int(props_iface.Get("org.mpris.MediaPlayer2.Player", "Position"))
-            volume = float(props_iface.Get("org.mpris.MediaPlayer2.Player", "Volume"))
+                playback_status = str(props.get("PlaybackStatus", "Stopped"))
+                is_playing = (playback_status.lower() == "playing")
 
-            can_play = bool(props_iface.Get("org.mpris.MediaPlayer2.Player", "CanPlay"))
-            can_pause = bool(props_iface.Get("org.mpris.MediaPlayer2.Player", "CanPause"))
-            can_go_next = bool(props_iface.Get("org.mpris.MediaPlayer2.Player", "CanGoNext"))
-            can_go_prev = bool(props_iface.Get("org.mpris.MediaPlayer2.Player", "CanGoPrevious"))
-            can_seek = bool(props_iface.Get("org.mpris.MediaPlayer2.Player", "CanSeek"))
+                metadata = props.get("Metadata", {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                title = str(metadata.get("xesam:title", ""))
+                artist_raw = metadata.get("xesam:artist", [])
+                artist = ", ".join(str(a) for a in artist_raw) if isinstance(artist_raw, (list, tuple)) else str(artist_raw or "")
+                album = str(metadata.get("xesam:album", ""))
+                art_url = str(metadata.get("mpris:artUrl", ""))
+                try:
+                    length_us = int(metadata.get("mpris:length", -1))
+                except (TypeError, ValueError):
+                    length_us = -1
+                url = str(metadata.get("xesam:url", ""))
 
-            loop_status = str(props_iface.Get("org.mpris.MediaPlayer2.Player", "LoopStatus") or "None")
-            shuffle = bool(props_iface.Get("org.mpris.MediaPlayer2.Player", "Shuffle") or False)
+                try:
+                    pos_us = int(props.get("Position", 0))
+                except (TypeError, ValueError):
+                    pos_us = 0
 
-            return PlayerState(
-                player=player,
-                title=title,
-                artist=artist,
-                album=album,
-                album_art_url=art_url,
-                is_playing=is_playing,
-                position_us=pos_us,
-                length_us=length_us,
-                volume=volume,
-                can_play=can_play,
-                can_pause=can_pause,
-                can_go_next=can_go_next,
-                can_go_previous=can_go_prev,
-                can_seek=can_seek,
-                loop_status=loop_status,
-                shuffle=shuffle,
-                url=url,
-            )
-        except Exception as exc:
-            logger.debug("Could not get player status for '%s': %s", player, exc)
-            return None
+                try:
+                    volume = float(props.get("Volume", 1.0))
+                except (TypeError, ValueError):
+                    volume = 1.0
+
+                can_play = bool(props.get("CanPlay", True))
+                can_pause = bool(props.get("CanPause", True))
+                can_go_next = bool(props.get("CanGoNext", False))
+                can_go_prev = bool(props.get("CanGoPrevious", False))
+                can_seek = bool(props.get("CanSeek", False))
+
+                loop_status = str(props.get("LoopStatus", "None") or "None")
+                shuffle = bool(props.get("Shuffle", False) or False)
+
+                return PlayerState(
+                    player=player,
+                    title=title,
+                    artist=artist,
+                    album=album,
+                    album_art_url=art_url,
+                    is_playing=is_playing,
+                    position_us=pos_us,
+                    length_us=length_us,
+                    volume=volume,
+                    can_play=can_play,
+                    can_pause=can_pause,
+                    can_go_next=can_go_next,
+                    can_go_previous=can_go_prev,
+                    can_seek=can_seek,
+                    loop_status=loop_status,
+                    shuffle=shuffle,
+                    url=url,
+                )
+            except Exception as exc:
+                logger.debug("Could not get player status for '%s': %s", player, exc)
+                return None
+
+        return await asyncio.to_thread(_do_get_status)
 
     async def send_action(self, player: str, action: str) -> bool:
         if not self._running or not self._bus:
@@ -539,28 +565,32 @@ class DBusMprisAdapter(MprisHostAdapter):
         bus_name = f"org.mpris.MediaPlayer2.{player}"
         if self.should_ignore_service(bus_name):
             return False
-        try:
-            import dbus  # type: ignore[import-untyped]
-            player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
-            player_iface = dbus.Interface(player_obj, "org.mpris.MediaPlayer2.Player")
 
-            action_map = {
-                "Play": "Play",
-                "Pause": "Pause",
-                "PlayPause": "PlayPause",
-                "Stop": "Stop",
-                "Next": "Next",
-                "Previous": "Previous",
-            }
-            method_name = action_map.get(action)
-            if not method_name:
+        def _do_send_action() -> bool:
+            try:
+                import dbus  # type: ignore[import-untyped]
+                player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
+                player_iface = dbus.Interface(player_obj, "org.mpris.MediaPlayer2.Player")
+
+                action_map = {
+                    "Play": "Play",
+                    "Pause": "Pause",
+                    "PlayPause": "PlayPause",
+                    "Stop": "Stop",
+                    "Next": "Next",
+                    "Previous": "Previous",
+                }
+                method_name = action_map.get(action)
+                if not method_name:
+                    return False
+                method = getattr(player_iface, method_name)
+                method()
+                return True
+            except Exception as exc:
+                logger.warning("Failed to invoke action '%s' on player '%s': %s", action, player, exc)
                 return False
-            method = getattr(player_iface, method_name)
-            method()
-            return True
-        except Exception as exc:
-            logger.warning("Failed to invoke action '%s' on player '%s': %s", action, player, exc)
-            return False
+
+        return await asyncio.to_thread(_do_send_action)
 
     async def set_volume(self, player: str, volume: float) -> bool:
         if not self._running or not self._bus:
@@ -568,16 +598,20 @@ class DBusMprisAdapter(MprisHostAdapter):
         bus_name = f"org.mpris.MediaPlayer2.{player}"
         if self.should_ignore_service(bus_name):
             return False
-        try:
-            import dbus  # type: ignore[import-untyped]
-            player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
-            props_iface = dbus.Interface(player_obj, "org.freedesktop.DBus.Properties")
-            clamped = max(0.0, min(1.0, float(volume)))
-            props_iface.Set("org.mpris.MediaPlayer2.Player", "Volume", dbus.Double(clamped))
-            return True
-        except Exception as exc:
-            logger.warning("Failed to set volume on player '%s': %s", player, exc)
-            return False
+
+        def _do_set_volume() -> bool:
+            try:
+                import dbus  # type: ignore[import-untyped]
+                player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
+                props_iface = dbus.Interface(player_obj, "org.freedesktop.DBus.Properties")
+                clamped = max(0.0, min(1.0, float(volume)))
+                props_iface.Set("org.mpris.MediaPlayer2.Player", "Volume", dbus.Double(clamped))
+                return True
+            except Exception as exc:
+                logger.warning("Failed to set volume on player '%s': %s", player, exc)
+                return False
+
+        return await asyncio.to_thread(_do_set_volume)
 
     async def seek(self, player: str, offset_us: int) -> bool:
         if not self._running or not self._bus:
@@ -585,15 +619,19 @@ class DBusMprisAdapter(MprisHostAdapter):
         bus_name = f"org.mpris.MediaPlayer2.{player}"
         if self.should_ignore_service(bus_name):
             return False
-        try:
-            import dbus  # type: ignore[import-untyped]
-            player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
-            player_iface = dbus.Interface(player_obj, "org.mpris.MediaPlayer2.Player")
-            player_iface.Seek(dbus.Int64(offset_us))
-            return True
-        except Exception as exc:
-            logger.warning("Failed to seek on player '%s': %s", player, exc)
-            return False
+
+        def _do_seek() -> bool:
+            try:
+                import dbus  # type: ignore[import-untyped]
+                player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
+                player_iface = dbus.Interface(player_obj, "org.mpris.MediaPlayer2.Player")
+                player_iface.Seek(dbus.Int64(offset_us))
+                return True
+            except Exception as exc:
+                logger.warning("Failed to seek on player '%s': %s", player, exc)
+                return False
+
+        return await asyncio.to_thread(_do_seek)
 
     async def set_position(self, player: str, position_us: int) -> bool:
         if not self._running or not self._bus:
@@ -601,22 +639,26 @@ class DBusMprisAdapter(MprisHostAdapter):
         bus_name = f"org.mpris.MediaPlayer2.{player}"
         if self.should_ignore_service(bus_name):
             return False
-        try:
-            import dbus  # type: ignore[import-untyped]
-            player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
-            player_iface = dbus.Interface(player_obj, "org.mpris.MediaPlayer2.Player")
-            track_id = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+
+        def _do_set_position() -> bool:
             try:
-                props_iface = dbus.Interface(player_obj, "org.freedesktop.DBus.Properties")
-                meta = props_iface.Get("org.mpris.MediaPlayer2.Player", "Metadata")
-                track_id = meta.get("mpris:trackid", track_id)
-            except Exception:
-                pass
-            player_iface.SetPosition(track_id, dbus.Int64(position_us))
-            return True
-        except Exception as exc:
-            logger.warning("Failed to set position on player '%s': %s", player, exc)
-            return False
+                import dbus  # type: ignore[import-untyped]
+                player_obj = self._bus.get_object(bus_name, "/org/mpris/MediaPlayer2")
+                player_iface = dbus.Interface(player_obj, "org.mpris.MediaPlayer2.Player")
+                track_id = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+                try:
+                    props_iface = dbus.Interface(player_obj, "org.freedesktop.DBus.Properties")
+                    meta = props_iface.Get("org.mpris.MediaPlayer2.Player", "Metadata")
+                    track_id = meta.get("mpris:trackid", track_id)
+                except Exception:
+                    pass
+                player_iface.SetPosition(track_id, dbus.Int64(position_us))
+                return True
+            except Exception as exc:
+                logger.warning("Failed to set position on player '%s': %s", player, exc)
+                return False
+
+        return await asyncio.to_thread(_do_set_position)
 
     def set_change_callback(
         self,

@@ -11,12 +11,20 @@ In KDE Connect:
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
+from datetime import datetime, timezone
 import logging
+import os
+from pathlib import Path
 import ssl
+import stat
+import sys
+import sysconfig
 import tempfile
-from typing import Optional, Union
+import uuid
+from typing import Iterator, Optional, Tuple, Union
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -81,8 +89,109 @@ def _get_libssl() -> Optional[ctypes.CDLL]:
     return _libssl_handle
 
 
+def _is_cpython_supported_abi() -> bool:
+    """Check if the runtime CPython ABI supports ctypes pointer access to PySSLContext."""
+    if sys.implementation.name != "cpython":
+        return False
+    # Check for Py_TRACE_REFS (debug build with object tracing modifies PyObject header)
+    if hasattr(sys, "getobjects"):
+        return False
+    trace_refs = sysconfig.get_config_var("Py_TRACE_REFS")
+    if trace_refs and str(trace_refs) not in ("0", "None", ""):
+        return False
+    # Check for free-threaded Python (PEP 703) which modifies object headers
+    gil_disabled = sysconfig.get_config_var("Py_GIL_DISABLED")
+    if gil_disabled and str(gil_disabled) not in ("0", "None", ""):
+        return False
+    if hasattr(sys, "_is_gil_enabled") and not sys._is_gil_enabled():
+        return False
+    return True
+
+
+def _get_secure_runtime_dir() -> Path:
+    """Return a dedicated secure directory (0700) for ephemeral TLS credentials."""
+    runtime_base = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_base and os.path.isdir(runtime_base):
+        base_dir = Path(runtime_base)
+    else:
+        base_dir = Path(tempfile.gettempdir())
+    secure_dir = base_dir / f"pengulink_{os.getuid() if hasattr(os, 'getuid') else 'user'}"
+    secure_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(secure_dir, 0o700)
+    except OSError:
+        pass
+    return secure_dir
+
+
+def _write_secure_temp_file(
+    prefix_or_dir: Union[Path, str],
+    data_or_prefix: Union[str, bytes],
+    data: Optional[bytes] = None,
+    mode: int = 0o600,
+) -> Path:
+    """Write data to a unique temporary file with strict atomic permissions."""
+    if data is None:
+        # Signature: _write_secure_temp_file(prefix, data, mode=0o600)
+        directory = _get_secure_runtime_dir()
+        prefix = str(prefix_or_dir)
+        raw_data = data_or_prefix if isinstance(data_or_prefix, bytes) else data_or_prefix.encode("utf-8")
+    else:
+        # Signature: _write_secure_temp_file(directory, prefix, data, mode=0o600)
+        directory = Path(prefix_or_dir)
+        prefix = str(data_or_prefix)
+        raw_data = data if isinstance(data, bytes) else data.encode("utf-8")
+
+    filename = f"{prefix}_{os.getpid()}_{uuid.uuid4().hex}.pem"
+    file_path = directory / filename
+    fd = os.open(file_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
+    try:
+        with open(fd, "wb", closefd=True) as f:
+            f.write(raw_data)
+            f.flush()
+    except Exception:
+        try:
+            os.unlink(file_path)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(file_path, mode)
+    except OSError:
+        pass
+    return file_path
+
+
+@contextlib.contextmanager
+def ephemeral_tls_credentials(
+    cert_bytes: bytes,
+    key_bytes: bytes,
+) -> Iterator[Tuple[Path, Path]]:
+    """Context manager creating temporary cert and key files in secure 0700 runtime dir,
+    cleaned up on exit.
+    """
+    secure_dir = _get_secure_runtime_dir()
+    cert_path = _write_secure_temp_file(secure_dir, "ephemeral_cert", cert_bytes, mode=0o600)
+    key_path = _write_secure_temp_file(secure_dir, "ephemeral_key", key_bytes, mode=0o600)
+    try:
+        yield cert_path, key_path
+    finally:
+        try:
+            cert_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            key_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _configure_server_tofu_verify(ctx: ssl.SSLContext) -> bool:
     """Configure server SSLContext to request peer certificate without failing on self-signed certs."""
+    if not _is_cpython_supported_abi():
+        logger.warning("Unsupported CPython ABI or debug build; cannot safely configure ctypes PySSLContextStruct")
+        return False
+
     libssl = _get_libssl()
     if not libssl:
         logger.warning("libssl not available; cannot configure server TOFU peer certificate request")
@@ -115,37 +224,17 @@ def create_paired_ssl_context(
     """
     proto = ssl.PROTOCOL_TLS_SERVER if server_side else ssl.PROTOCOL_TLS_CLIENT
     ctx = ssl.SSLContext(proto)
-
-    # Minimum TLS 1.2, allow TLS 1.3
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
-    # Load local credentials via temporary files (Python SSLContext requires paths or buffers)
-    with tempfile.NamedTemporaryFile("wb", delete=False) as f_cert, \
-         tempfile.NamedTemporaryFile("wb", delete=False) as f_key:
-        try:
-            f_cert.write(local_cert_pem)
-            f_cert.flush()
-            f_key.write(local_key_pem)
-            f_key.flush()
-            ctx.load_cert_chain(f_cert.name, f_key.name)
-        finally:
-            import os
-            try:
-                os.remove(f_cert.name)
-            except OSError:
-                pass
-            try:
-                os.remove(f_key.name)
-            except OSError:
-                pass
+    with ephemeral_tls_credentials(local_cert_pem, local_key_pem) as (f_cert, f_key):
+        ctx.load_cert_chain(str(f_cert), str(f_key))
 
-    # Pin peer certificate
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_REQUIRED
 
-    # Load peer cert as trusted CA / trust anchor
     try:
-        ctx.load_verify_locations(cadata=peer_cert_pem.decode("utf-8"))
+        cadata = peer_cert_pem.decode("utf-8") if isinstance(peer_cert_pem, bytes) else peer_cert_pem
+        ctx.load_verify_locations(cadata=cadata)
     except Exception as exc:
         raise CertificateError(f"Failed to load pinned peer certificate into SSLContext: {exc}") from exc
 
@@ -153,64 +242,73 @@ def create_paired_ssl_context(
 
 
 def create_tofu_ssl_context(
-    local_cert_pem: bytes,
-    local_key_pem: bytes,
-    server_side: bool,
+    local_cert_pem: Optional[bytes] = None,
+    local_key_pem: Optional[bytes] = None,
+    server_side: Optional[bool] = None,
+    *,
+    cert_pem: Optional[bytes] = None,
+    key_pem: Optional[bytes] = None,
+    pinned_cert_pem: Optional[bytes] = None,
+    is_server: Optional[bool] = None,
 ) -> ssl.SSLContext:
     """Construct an SSLContext for unpaired devices during initial pairing (TOFU).
 
     Peer certificate is captured for user inspection and subsequent pinning.
     """
-    proto = ssl.PROTOCOL_TLS_SERVER if server_side else ssl.PROTOCOL_TLS_CLIENT
+    cert = local_cert_pem if local_cert_pem is not None else cert_pem
+    key = local_key_pem if local_key_pem is not None else key_pem
+    if cert is None or key is None:
+        raise CertificateError("Certificate and private key PEM bytes are required")
+
+    is_srv = server_side if server_side is not None else (is_server if is_server is not None else True)
+
+    proto = ssl.PROTOCOL_TLS_SERVER if is_srv else ssl.PROTOCOL_TLS_CLIENT
     ctx = ssl.SSLContext(proto)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
-    with tempfile.NamedTemporaryFile("wb", delete=False) as f_cert, \
-         tempfile.NamedTemporaryFile("wb", delete=False) as f_key:
-        try:
-            f_cert.write(local_cert_pem)
-            f_cert.flush()
-            f_key.write(local_key_pem)
-            f_key.flush()
-            ctx.load_cert_chain(f_cert.name, f_key.name)
-        finally:
-            import os
-            try:
-                os.remove(f_cert.name)
-            except OSError:
-                pass
-            try:
-                os.remove(f_key.name)
-            except OSError:
-                pass
+    with ephemeral_tls_credentials(cert, key) as (f_cert, f_key):
+        ctx.load_cert_chain(str(f_cert), str(f_key))
 
     ctx.check_hostname = False
-    # Unpaired connections permit self-signed peer certificates for TOFU capture
     ctx.verify_mode = ssl.CERT_NONE
 
-    if server_side:
-        _configure_server_tofu_verify(ctx)
+    if is_srv:
+        configured = _configure_server_tofu_verify(ctx)
+        if not configured:
+            raise CertificateError(
+                "Failed to configure secure TOFU server context: unable to request client certificate "
+                "without strict CA verification on this platform/ABI."
+            )
 
     return ctx
 
 
 def verify_peer_certificate(
-    peer_cert_bytes: bytes,
+    peer_cert_or_bytes: Union[bytes, x509.Certificate],
     expected_device_id: str,
-    pinned_cert_pem: Optional[bytes] = None,
-) -> x509.Certificate:
-    """Validate a peer's X.509 certificate against device ID and pinned trust.
+    pinned_cert_pem: Optional[Union[bytes, str]] = None,
+    *,
+    pinned_cert: Optional[Union[bytes, str]] = None,
+) -> bool:
+    """Validate a peer's X.509 certificate against device ID, validity window, and pinned trust.
 
     CVE-2020-26164 Defense:
     1. Extracts Common Name (CN) from Subject attributes.
     2. CN must strictly match expected_device_id.
-    3. If pinned_cert_pem is provided, peer cert must match pinned cert.
+    3. Certificate must be valid according to current UTC time.
+    4. If pinned_cert_pem is provided, peer cert must match pinned cert.
     """
+    effective_pinned = pinned_cert_pem if pinned_cert_pem is not None else pinned_cert
+    if isinstance(effective_pinned, str):
+        effective_pinned = effective_pinned.encode("utf-8")
+
     try:
-        if peer_cert_bytes.startswith(b"-----BEGIN CERTIFICATE-----"):
-            peer_cert = load_certificate_pem(peer_cert_bytes)
+        if isinstance(peer_cert_or_bytes, x509.Certificate):
+            peer_cert = peer_cert_or_bytes
+        elif peer_cert_or_bytes.startswith(b"-----BEGIN CERTIFICATE-----"):
+            peer_cert = load_certificate_pem(peer_cert_or_bytes)
         else:
-            peer_cert = x509.load_der_x509_certificate(peer_cert_bytes)
+            peer_cert = x509.load_der_x509_certificate(peer_cert_or_bytes)
     except Exception as exc:
         raise CertificateVerificationError(
             f"Failed to parse peer certificate: {exc}",
@@ -226,11 +324,36 @@ def verify_peer_certificate(
             presented_cn=cn,
         )
 
-    # 2. Verify pinned certificate if provided
-    if pinned_cert_pem:
-        pinned_cert = load_certificate_pem(pinned_cert_pem)
+    # 2. Verify certificate validity window (UTC expiration check)
+    now_utc = datetime.now(timezone.utc)
+    try:
+        not_before = peer_cert.not_valid_before_utc
+        not_after = peer_cert.not_valid_after_utc
+    except AttributeError:
+        not_before = peer_cert.not_valid_before.replace(tzinfo=timezone.utc)
+        not_after = peer_cert.not_valid_after.replace(tzinfo=timezone.utc)
+
+    if now_utc < not_before:
+        raise CertificateVerificationError(
+            f"Peer certificate is not yet valid (valid from {not_before}, current UTC time is {now_utc})",
+            expected_device_id=expected_device_id,
+            presented_cn=cn,
+            context={"not_valid_before": str(not_before), "current_time": str(now_utc)},
+        )
+
+    if now_utc > not_after:
+        raise CertificateVerificationError(
+            f"Peer certificate has expired (expired at {not_after}, current UTC time is {now_utc})",
+            expected_device_id=expected_device_id,
+            presented_cn=cn,
+            context={"not_valid_after": str(not_after), "current_time": str(now_utc)},
+        )
+
+    # 3. Verify pinned certificate if provided
+    if effective_pinned:
+        pinned_c = load_certificate_pem(effective_pinned)
         peer_fp = get_certificate_fingerprint(peer_cert)
-        pinned_fp = get_certificate_fingerprint(pinned_cert)
+        pinned_fp = get_certificate_fingerprint(pinned_c)
         if peer_fp != pinned_fp:
             raise CertificateVerificationError(
                 f"Peer certificate fingerprint {peer_fp} does not match pinned fingerprint {pinned_fp}",
@@ -239,4 +362,5 @@ def verify_peer_certificate(
                 context={"peer_fingerprint": peer_fp, "pinned_fingerprint": pinned_fp},
             )
 
-    return peer_cert
+    return True
+

@@ -54,8 +54,8 @@ MAX_CLIPBOARD_PACKET_BYTES: int = 120_000
 # Default write-in-flight TTL window in seconds
 DEFAULT_WRITE_IN_FLIGHT_TTL: float = 0.5
 
-# Maximum allowed future clock drift for remote timestamps (24 hours in ms)
-MAX_FUTURE_CLOCK_DRIFT_MS: int = 86_400_000
+# Maximum allowed future clock drift for remote timestamps (15 seconds in ms)
+MAX_FUTURE_CLOCK_DRIFT_MS: int = 15_000
 
 
 def create_clipboard_packet(content: str, timestamp: Optional[int] = None) -> Packet:
@@ -317,7 +317,9 @@ class LoopSuppressionEngine:
         - Caches digest in Layer 1 LRU
         - Arms Layer 2 write-in-flight window
         """
-        self._local_timestamp_ms = max(self._local_timestamp_ms, remote_timestamp)
+        now_ms = self.current_wall_ms()
+        clamped_remote = min(remote_timestamp, now_ms + self.max_future_drift_ms)
+        self._local_timestamp_ms = max(self._local_timestamp_ms, clamped_remote)
         digest = self._digest_cache.add_text(content)
         self.arm_write_in_flight(content, ttl=ttl)
         return digest
@@ -426,11 +428,13 @@ class ClipboardPlugin(Plugin):
         ttl_seconds: float = DEFAULT_WRITE_IN_FLIGHT_TTL,
         digest_cache_size: int = 32,
         max_future_drift_ms: int = MAX_FUTURE_CLOCK_DRIFT_MS,
+        is_paired_checker: Optional[Callable[[str], Any]] = None,
     ) -> None:
         super().__init__(event_bus=event_bus)
         self._backend: ClipboardBackend = backend or detect_clipboard_backend()
         self._packet_sender = packet_sender
         self._capability_checker = capability_checker
+        self._is_paired_checker = is_paired_checker
 
         self._suppression = LoopSuppressionEngine(
             cache_capacity=digest_cache_size,
@@ -581,6 +585,21 @@ class ClipboardPlugin(Plugin):
                 device_id,
             )
             return
+
+        if self._is_paired_checker is not None:
+            check_res = self._is_paired_checker(device_id)
+            if inspect.isawaitable(check_res):
+                check_res = await check_res
+            if not check_res:
+                body_dict = packet.body if isinstance(packet.body, dict) else {}
+                content_val = body_dict.get("content")
+                redacted_info = f" ({redact_clipboard(content_val)})" if isinstance(content_val, str) else ""
+                logger.warning(
+                    "ClipboardPlugin: Discarding clipboard packet from unpaired device '%s'%s",
+                    device_id,
+                    redacted_info,
+                )
+                return True
 
         # Track device sender callback
         self._device_senders[device_id] = send_packet

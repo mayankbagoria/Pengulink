@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
-from pengulink.core.events import BatteryUpdated, EventBus
+from pengulink.core.events import BatteryUpdated, DeviceUnpaired, EventBus
 from pengulink.network.packet import Packet
 from pengulink.plugins.base import Plugin, SendPacketCallable, safe_send_packet
 
@@ -62,9 +62,24 @@ class BatteryPlugin(Plugin):
     def __init__(self, event_bus: Optional[EventBus] = None) -> None:
         super().__init__(event_bus)
         self._device_states: Dict[str, DeviceBatteryState] = {}
+        self._unsub_unpair: Optional[Callable[[], None]] = None
         # Local host battery defaults (-1 = desktop/plugged-in AC)
         self.local_charge: int = -1
         self.local_is_charging: bool = True
+
+    async def start(self) -> None:
+        await super().start()
+        if self.event_bus:
+            self._unsub_unpair = self.event_bus.subscribe(DeviceUnpaired, self._on_device_unpaired)
+
+    async def stop(self) -> None:
+        if self._unsub_unpair:
+            self._unsub_unpair()
+            self._unsub_unpair = None
+        await super().stop()
+
+    def _on_device_unpaired(self, event: DeviceUnpaired) -> None:
+        self._device_states.pop(event.device_id, None)
 
     @property
     def plugin_id(self) -> str:

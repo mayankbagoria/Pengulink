@@ -79,16 +79,32 @@ class DeviceStore:
         is_paired: bool = False,
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Persist or update device record."""
-        record: Dict[str, Any] = {
-            "device_id": device_id,
-            "device_name": name,
-            "device_type": device_type,
-            "certificate_pem": certificate_pem,
-            "is_paired": is_paired,
-        }
-        if extra:
-            record.update(extra)
+        """Persist or update device record, preserving existing credentials and pairing state."""
+        existing = await self.get_device(device_id)
+        if existing:
+            final_device_type = existing.get("device_type", device_type) if device_type == "desktop" else device_type
+            final_cert = existing.get("certificate_pem") if certificate_pem is None else certificate_pem
+            final_is_paired = existing.get("is_paired", False) if not is_paired else True
+            record: Dict[str, Any] = dict(existing)
+            record.update({
+                "device_id": device_id,
+                "device_name": name,
+                "device_type": final_device_type,
+                "certificate_pem": final_cert,
+                "is_paired": final_is_paired,
+            })
+            if extra:
+                record.update(extra)
+        else:
+            record = {
+                "device_id": device_id,
+                "device_name": name,
+                "device_type": device_type,
+                "certificate_pem": certificate_pem,
+                "is_paired": is_paired,
+            }
+            if extra:
+                record.update(extra)
         await self.backend.save_device(device_id, record)
 
     async def delete_device(self, device_id: str) -> bool:

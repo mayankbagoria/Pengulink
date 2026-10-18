@@ -8,6 +8,7 @@ and processes remote transport control requests via kdeconnect.mpris.request.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -250,14 +251,24 @@ class MprisControl(Plugin):
         if not event.device_id:
             return
         sender = self._connected_peers.get(event.device_id)
+        players = await self.adapter.list_players()
+        pkt = Packet(
+            type="kdeconnect.mpris",
+            body={"playerList": players, "supportAlbumArtPayload": True},
+        )
         if sender:
-            players = await self.adapter.list_players()
-            pkt = Packet(
-                type="kdeconnect.mpris",
-                body={"playerList": players, "supportAlbumArtPayload": True},
-            )
             try:
                 await safe_send_packet(sender, pkt)
+            except Exception:
+                pass
+        elif self.packet_sender:
+            try:
+                try:
+                    res = self.packet_sender(event.device_id, pkt)
+                except TypeError:
+                    res = self.packet_sender(pkt)
+                if inspect.isawaitable(res):
+                    await res
             except Exception:
                 pass
 

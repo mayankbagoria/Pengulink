@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import inspect
 import json
 import logging
 import math
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from pengulink.core.events import (
     DeviceUnpaired,
@@ -265,9 +266,11 @@ class RemoteCommandsPlugin(Plugin):
         self,
         event_bus: Optional[EventBus] = None,
         packet_sender: Optional[SendPacketCallable] = None,
+        is_paired_checker: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self.event_bus = event_bus
         self.packet_sender = packet_sender
+        self.is_paired_checker = is_paired_checker
         self._device_commands: Dict[str, DeviceRemoteCommands] = {}
         self._connected_senders: Dict[str, SendPacketCallable] = {}
         self._lock = asyncio.Lock()
@@ -341,6 +344,17 @@ class RemoteCommandsPlugin(Plugin):
         CRITICAL SECURITY INVARIANT:
         Never execute local subprocesses or shell commands under any circumstance.
         """
+        if self.is_paired_checker is not None:
+            check_res = self.is_paired_checker(device_id)
+            if inspect.isawaitable(check_res):
+                check_res = await check_res
+            if not check_res:
+                logger.warning(
+                    "RemoteCommandsPlugin rejecting packet from unauthenticated/unpaired device '%s'",
+                    device_id,
+                )
+                return True
+
         self._connected_senders[device_id] = send_packet
         body = packet.body or {}
 
@@ -381,7 +395,10 @@ class RemoteCommandsPlugin(Plugin):
         elif packet.type == "kdeconnect.runcommand.output":
             key = str(body.get("key", ""))
             raw_output = body.get("output") or body.get("result") or body.get("stdout") or ""
-            output_str = str(raw_output)
+            if self.is_paired_checker is not None:
+                output_str = str(raw_output)[:65536]
+            else:
+                output_str = str(raw_output)
 
             raw_code = body.get("exitCode") or body.get("exit_code") or body.get("status") or 0
             try:

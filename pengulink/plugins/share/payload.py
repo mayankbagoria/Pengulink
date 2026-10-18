@@ -194,7 +194,7 @@ class PayloadServer:
 
             with open(source_path, "rb") as f:
                 while bytes_sent < file_size:
-                    chunk = f.read(CHUNK_SIZE)
+                    chunk = await asyncio.to_thread(f.read, CHUNK_SIZE)
                     if not chunk:
                         break
                     writer.write(chunk)

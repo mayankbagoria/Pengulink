@@ -70,10 +70,13 @@ class DeviceStateMachine:
             DeviceState.PAIRED,
             DeviceState.DISCONNECTING,
             DeviceState.DISCONNECTED,
+            DeviceState.ERROR,
         },
         DeviceState.PAIRED: {
             DeviceState.CONNECTED,
             DeviceState.DISCONNECTING,
+            DeviceState.DISCONNECTED,
+            DeviceState.ERROR,
         },
         DeviceState.CONNECTED: {
             DeviceState.DISCONNECTING,

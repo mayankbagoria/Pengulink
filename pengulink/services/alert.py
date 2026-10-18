@@ -506,30 +506,32 @@ class AlertService:
 
     async def stop_alert(self, reason: str = "manual") -> bool:
         """Stop the active alert immediately, terminating child processes cleanly."""
-        if not self._is_active:
-            return False
+        async with self._lock:
+            if not self._is_active:
+                return False
 
-        loop_task = self._loop_task
-        notification_task = self._notification_task
+            loop_task = self._loop_task
+            notification_task = self._notification_task
 
-        self._stop_reason = reason
-        self._stop_event.set()
-        self._is_active = False
+            self._stop_reason = reason
+            self._stop_event.set()
+            self._is_active = False
 
-        if notification_task is not None and not notification_task.done():
-            notification_task.cancel()
-            try:
-                await notification_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            if notification_task is not None and not notification_task.done():
+                notification_task.cancel()
+                try:
+                    await notification_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
-        # Immediate process termination (SIGTERM -> SIGKILL)
-        proc = self._current_process
+            # Immediate process termination (SIGTERM -> SIGKILL)
+            proc = self._current_process
+            self._current_process = None
 
-        if proc is not None:
-            await self._terminate_process(proc)
+            if proc is not None:
+                await self._terminate_process(proc)
 
-        # Await loop task completion cleanly without deadlock
+        # Await loop task completion cleanly without deadlock (loop task acquires self._lock in finally)
         if loop_task is not None and not loop_task.done():
             try:
                 await asyncio.wait_for(asyncio.shield(loop_task), timeout=2.0)

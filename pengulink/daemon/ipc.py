@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import json
 import logging
 import os
 from pathlib import Path
+import socket
+import struct
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Union
 
 from pengulink.core.exceptions import (
@@ -106,6 +109,11 @@ class PenguLinkIPCServer:
         self._running: bool = False
         self._client_tasks: set[asyncio.Task[Any]] = set()
         self._client_writers: set[asyncio.StreamWriter] = set()
+        self._handlers: Dict[str, Callable[[Any], Any]] = {}
+
+    def register_handler(self, method: str, handler: Callable[[Any], Any]) -> None:
+        """Register a handler callback for a specific JSON-RPC method."""
+        self._handlers[method] = handler
 
     @property
     def is_running(self) -> bool:
@@ -231,6 +239,25 @@ class PenguLinkIPCServer:
 
         logger.info("PenguLink IPC server stopped.")
 
+    def _is_authorized_peer(self, sock: Optional[socket.socket]) -> bool:
+        """Validate peer credentials via SO_PEERCRED on Unix domain sockets."""
+        if sock and hasattr(socket, "SO_PEERCRED") and hasattr(os, "getuid"):
+            try:
+                cred_bytes = sock.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                )
+                _, peer_uid, _ = struct.unpack("3i", cred_bytes)
+                if peer_uid != os.getuid():
+                    logger.warning(
+                        "SECURITY ALERT: Rejected IPC connection from unauthorized UID %d (expected UID %d)",
+                        peer_uid,
+                        os.getuid(),
+                    )
+                    return False
+            except OSError as exc:
+                logger.debug("SO_PEERCRED query failed or unsupported on socket: %s", exc)
+        return True
+
     async def _handle_client(
         self,
         reader: asyncio.StreamReader,
@@ -243,6 +270,16 @@ class PenguLinkIPCServer:
             task.add_done_callback(self._client_tasks.discard)
         self._client_writers.add(writer)
 
+        # SO_PEERCRED UID validation on Unix domain sockets
+        sock: Optional[socket.socket] = writer.get_extra_info("socket")
+        if not self._is_authorized_peer(sock):
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
         try:
             while self._running:
                 try:
@@ -252,6 +289,9 @@ class PenguLinkIPCServer:
                     break
 
                 if not line:
+                    break
+
+                if not self._is_authorized_peer(sock):
                     break
 
                 response_bytes = await self._process_request_line(line)
@@ -295,6 +335,24 @@ class PenguLinkIPCServer:
 
         if not isinstance(params, dict):
             return self._format_error(req_id, INVALID_PARAMS, "Params must be an object")
+
+        if method in self._handlers:
+            handler_fn = self._handlers[method]
+            try:
+                res = handler_fn(params)
+                if inspect.isawaitable(res):
+                    res = await res
+                result = res
+                if not has_id:
+                    return b""
+                response = {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "result": result,
+                    "id": req_id,
+                }
+                return (json.dumps(response) + "\n").encode("utf-8")
+            except Exception as exc:
+                return self._format_error(req_id if has_id else None, INTERNAL_ERROR, str(exc)) if has_id else b""
 
         if not self.handler:
             return self._format_error(req_id, INTERNAL_ERROR, "No request handler registered")
@@ -503,6 +561,21 @@ class PenguLinkIPCClient:
         """Initiate pairing and return visual verification code."""
         res = await self.call("pair_device", {"device_id": device_id, "timeout": timeout}, timeout=timeout + 5.0)
         return dict(res) if isinstance(res, dict) else {}
+
+    async def pair_accept(self, device_id: str) -> Dict[str, Any]:
+        """Accept an incoming pairing request from a remote device."""
+        res = await self.call("pair_accept", {"device_id": device_id})
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def pair_reject(self, device_id: str) -> Dict[str, Any]:
+        """Reject an incoming pairing request from a remote device."""
+        res = await self.call("pair_reject", {"device_id": device_id})
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def get_pending_pairings(self) -> List[Dict[str, Any]]:
+        """List active pending inbound pairing requests."""
+        res = await self.call("get_pending_pairings")
+        return list(res) if isinstance(res, list) else []
 
     async def unpair_device(self, device_id: str) -> Dict[str, Any]:
         """Revoke pairing and purge stored credentials."""

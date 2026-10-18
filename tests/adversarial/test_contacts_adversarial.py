@@ -42,6 +42,7 @@ from pengulink.core.events import EventBus
 from pengulink.core.exceptions import (
     LimitOverrunError,
     PacketBufferOverrunError,
+    PathTraversalError,
     SyncTimeoutError,
 )
 from pengulink.network.packet import MAX_PACKET_SIZE, Packet, PacketEngine
@@ -265,20 +266,17 @@ class TestPathTraversalAndSecurity:
             assert c is not None
             assert c.uid == uid
 
-    def test_device_id_path_traversal_behavior(self, tmp_path: Path) -> None:
+    def test_path_traversal_detection(self, tmp_path: Path) -> None:
         """Audit device_id path traversal handling in ContactStore._get_device_file.
         
-        If an unsanitized device_id containing '../' is provided, document whether
-        the path escapes the contacts directory.
+        If an unsanitized device_id containing '../' is provided, PathTraversalError
+        must be raised to prevent escaping the contacts directory.
         """
         store = ContactStore(data_dir=tmp_path)
-        escaped_file = store._get_device_file("../../tmp/evil")
-        resolved = escaped_file.resolve()
-        contacts_dir_resolved = store.contacts_dir.resolve()
+        with pytest.raises(PathTraversalError):
+            store._get_device_file("../../tmp/evil")
 
-        escaped = not str(resolved).startswith(str(contacts_dir_resolved))
-        # Document the empirical finding: ContactStore does not sanitize device_id
-        assert escaped is True, "Expected raw device_id '../../tmp/evil' to escape contacts_dir"
+    test_device_id_path_traversal_behavior = test_path_traversal_detection
 
 
 # =============================================================================

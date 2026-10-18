@@ -118,6 +118,25 @@ async def test_pairing_inbound_mock_initiated(tmp_path: Path) -> None:
         assert ev.verification_code == code
         assert ev.verification_code == mock.last_verification_code
 
+        # 4. Accept the inbound pairing request via daemon
+        accept_res = await daemon.accept_pairing(mock.device_id)
+        assert accept_res["status"] == "paired"
+        assert accept_res["device_id"] == mock.device_id
+
+        # 5. Verify daemon state transitioned to PAIRED and CONNECTED
+        assert daemon.is_device_paired(mock.device_id) is True
+        assert daemon.is_device_connected(mock.device_id) is True
+
+        sm = daemon._state_machines.get(mock.device_id)
+        assert sm is not None
+        assert sm.current_state == DeviceState.CONNECTED
+
+        # 6. Verify device persisted in device store
+        stored_device = await daemon.device_store.get_device(mock.device_id)
+        assert stored_device is not None
+        assert stored_device.get("is_paired") is True
+        assert stored_device.get("certificate_pem") is not None
+
 
 async def test_pairing_rejected_by_mock(tmp_path: Path) -> None:
     """Verify daemon handles pairing rejection by MockDevice properly.

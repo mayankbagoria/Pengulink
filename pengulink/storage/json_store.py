@@ -37,7 +37,12 @@ class JsonStorageBackend(StorageBackend):
         async with self._lock:
             if self._initialized:
                 return
-            self.storage_dir.mkdir(parents=True, exist_ok=True)
+            self.storage_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if self.storage_dir.resolve() != Path.home().resolve():
+                try:
+                    os.chmod(self.storage_dir, 0o700)
+                except OSError:
+                    pass
             self._devices_cache = await asyncio.to_thread(self._load_json_file, self.devices_file)
             self._config_cache = await asyncio.to_thread(self._load_json_file, self.config_file)
             self._initialized = True
@@ -65,12 +70,24 @@ class JsonStorageBackend(StorageBackend):
             return {}
 
     def _save_json_file(self, path: Path, data: Dict[str, Any]) -> None:
-        """Write JSON file atomically using a temporary file."""
-        tmp_file = path.with_suffix(".tmp")
+        """Write JSON file atomically using a temporary file with secure 0o600 permissions."""
+        tmp_file = path.with_suffix(f".tmp.{os.getpid()}.{time.time_ns()}")
         try:
-            content = json.dumps(data, indent=2, ensure_ascii=False)
-            tmp_file.write_text(content, encoding="utf-8")
+            content = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            fd = os.open(tmp_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, content)
+            finally:
+                os.close(fd)
+            try:
+                os.chmod(tmp_file, 0o600)
+            except OSError:
+                pass
             tmp_file.replace(path)
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
         except Exception as exc:
             if tmp_file.exists():
                 try:
@@ -79,16 +96,24 @@ class JsonStorageBackend(StorageBackend):
                     pass
             raise StorageWriteError(f"Failed writing {path}: {exc}") from exc
 
+    async def _ensure_initialized(self) -> None:
+        """Ensure storage directory and cache are loaded before any operation."""
+        if not self._initialized:
+            await self.initialize()
+
     async def get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+        await self._ensure_initialized()
         async with self._lock:
             return self._devices_cache.get(device_id)
 
     async def save_device(self, device_id: str, data: Dict[str, Any]) -> None:
+        await self._ensure_initialized()
         async with self._lock:
             self._devices_cache[device_id] = dict(data)
             await asyncio.to_thread(self._save_json_file, self.devices_file, self._devices_cache)
 
     async def delete_device(self, device_id: str) -> bool:
+        await self._ensure_initialized()
         async with self._lock:
             if device_id in self._devices_cache:
                 del self._devices_cache[device_id]
@@ -97,14 +122,17 @@ class JsonStorageBackend(StorageBackend):
             return False
 
     async def list_devices(self) -> List[Dict[str, Any]]:
+        await self._ensure_initialized()
         async with self._lock:
             return list(self._devices_cache.values())
 
     async def get_config(self, key: str, default: Any = None) -> Any:
+        await self._ensure_initialized()
         async with self._lock:
             return self._config_cache.get(key, default)
 
     async def set_config(self, key: str, value: Any) -> None:
+        await self._ensure_initialized()
         async with self._lock:
             self._config_cache[key] = value
             await asyncio.to_thread(self._save_json_file, self.config_file, self._config_cache)

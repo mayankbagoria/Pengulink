@@ -6,6 +6,7 @@ and pairing negotiation protocol handler.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import logging
 import time
@@ -22,7 +23,9 @@ from pengulink.network.packet import Packet
 logger = logging.getLogger("pengulink.crypto.pairing")
 
 PAIR_PACKET_TYPE = "kdeconnect.pair"
-MAX_TIMESTAMP_DRIFT_SECONDS = 1800.0  # 30-minute drift window for replay protection
+MAX_TIMESTAMP_DRIFT_SECONDS = 300.0  # 5-minute drift window for replay protection
+_PAIRING_REPLAY_CACHE: collections.OrderedDict[Tuple[str, int], float] = collections.OrderedDict()
+_REPLAY_CACHE_MAX_SIZE = 1024
 
 
 def create_pair_packet(pair: bool, timestamp: Optional[int] = None) -> Packet:
@@ -67,8 +70,9 @@ def compute_verification_code(
 def validate_pairing_timestamp(
     timestamp: int,
     max_drift: float = MAX_TIMESTAMP_DRIFT_SECONDS,
+    device_id: Optional[str] = None,
 ) -> None:
-    """Ensure pairing packet timestamp is within allowable drift window."""
+    """Ensure pairing packet timestamp is within allowable drift window and check for replay."""
     now = time.time()
     drift = abs(now - timestamp)
     if drift > max_drift:
@@ -76,6 +80,23 @@ def validate_pairing_timestamp(
             f"Pairing timestamp {timestamp} drifted by {drift:.1f}s (max allowed: {max_drift}s)",
             context={"timestamp": timestamp, "drift": drift, "max_drift": max_drift},
         )
+
+    # Replay protection cache (keyed on (device_id, timestamp))
+    cache_key = (str(device_id or "global"), int(timestamp))
+    cutoff = now - max_drift
+    while _PAIRING_REPLAY_CACHE:
+        oldest_k, oldest_time = next(iter(_PAIRING_REPLAY_CACHE.items()))
+        if oldest_time < cutoff or len(_PAIRING_REPLAY_CACHE) > _REPLAY_CACHE_MAX_SIZE:
+            _PAIRING_REPLAY_CACHE.pop(oldest_k, None)
+        else:
+            break
+
+    if cache_key in _PAIRING_REPLAY_CACHE:
+        raise PairingTimestampExpiredError(
+            f"Pairing replay detected: timestamp {timestamp} was already processed for {cache_key[0]}",
+            context={"timestamp": timestamp, "device_id": device_id},
+        )
+    _PAIRING_REPLAY_CACHE[cache_key] = now
 
 
 class PairingSession:
@@ -121,14 +142,16 @@ class PairingSession:
         Returns:
             Tuple of (pair_accepted, verification_code).
         Raises:
-            PairingRejectedError if pair is False.
-            PairingTimestampExpiredError if timestamp is stale.
+            PairingRejectedError if pair is False or not boolean True.
+            PairingTimestampExpiredError if timestamp is stale or replayed.
         """
         if packet.type != PAIR_PACKET_TYPE:
             raise PairingError(f"Expected packet type '{PAIR_PACKET_TYPE}', got '{packet.type}'")
 
         body = packet.body
-        is_pair = body.get("pair")
+        raw_pair = body.get("pair")
+        # Strict boolean validation: string "false", False, None, etc. must evaluate to False
+        is_pair = (raw_pair is True)
         if not is_pair:
             logger.info("Pairing request was rejected or revoked by %s", self.remote_device_id)
             raise PairingRejectedError(
@@ -138,10 +161,24 @@ class PairingSession:
 
         ts = body.get("timestamp")
         if ts is not None:
-            validate_pairing_timestamp(int(ts))
-            self.pairing_timestamp = int(ts)
-        elif self.pairing_timestamp is None:
-            self.pairing_timestamp = int(time.time())
+            validate_pairing_timestamp(int(ts), max_drift=MAX_TIMESTAMP_DRIFT_SECONDS, device_id=self.remote_device_id)
+
+        # Deterministic tie-breaking on device ID for concurrent pairing initiation
+        if self.pairing_requested and self.pairing_timestamp is not None:
+            # Both endpoints initiated pairing concurrently.
+            # Master is deterministically the node with smaller device ID.
+            if str(self.local_device_id) < str(self.remote_device_id):
+                # We are master: keep our own timestamp
+                chosen_ts = self.pairing_timestamp
+            else:
+                # Remote is master: adopt remote timestamp
+                chosen_ts = int(ts) if ts is not None else self.pairing_timestamp
+            self.pairing_timestamp = chosen_ts
+        else:
+            if ts is not None:
+                self.pairing_timestamp = int(ts)
+            elif self.pairing_timestamp is None:
+                self.pairing_timestamp = int(time.time())
 
         self.verification_code = compute_verification_code(
             self.local_pubkey_pem,

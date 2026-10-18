@@ -176,14 +176,14 @@ def _unescape_vcard_value(val: str) -> str:
     return val
 
 
-def parse_vcard_line(line: str) -> Tuple[str, Dict[str, str], str]:
+def parse_vcard_line(line: str, unescape: bool = True) -> Tuple[str, Dict[str, str], str]:
     """Parse a single logical vCard line into (property_name, parameters_dict, value).
     
     Handles:
     - Group prefixes (e.g. 'item1.TEL' -> 'TEL').
     - Parameters (e.g. 'TEL;TYPE=CELL,VOICE:...', 'TEL;WORK:...', 'ENCODING=QUOTED-PRINTABLE;CHARSET=UTF-8:...').
     - Quoted-Printable decoding.
-    - Value unescaping.
+    - Value unescaping (delayed for structured fields like N and ORG to prevent splitting corruption).
     """
     if ":" not in line:
         return "", {}, ""
@@ -231,8 +231,11 @@ def parse_vcard_line(line: str) -> Tuple[str, Dict[str, str], str]:
         except Exception as exc:
             logger.debug("Failed Quoted-Printable decoding for property %s: %s", prop_name, exc)
 
-    # Unescape value
-    value = _unescape_vcard_value(value.strip())
+    # Delay unescaping for structured fields to prevent premature delimiter splitting
+    if unescape and prop_name not in ("N", "ORG", "ADR"):
+        value = _unescape_vcard_value(value.strip())
+    else:
+        value = value.strip()
     return prop_name, params, value
 
 
@@ -286,14 +289,19 @@ def resolve_contact_name(
 
 
 def parse_vcard(
-    uid: str,
-    raw_vcard: str,
+    uid_or_raw: str,
+    raw_vcard: Optional[str] = None,
     device_id: str = "",
     timestamp: int = 0,
-) -> Contact:
-    """Parse raw RFC 2426 / 2.1 vCard text into a Contact dataclass."""
-    uid = str(uid).strip()
-    raw_vcard_str = str(raw_vcard or "")
+) -> Union[Contact, List[Contact]]:
+    """Parse raw RFC 2426 / 2.1 vCard text into a Contact dataclass or list of Contacts."""
+    is_single_arg = (raw_vcard is None)
+    if is_single_arg:
+        raw_vcard_str = str(uid_or_raw or "")
+        uid = f"contact_{int(time.time()*1000)}"
+    else:
+        uid = str(uid_or_raw).strip()
+        raw_vcard_str = str(raw_vcard or "")
     lines = unfold_vcard_lines(raw_vcard_str)
 
     fn = ""
@@ -326,7 +334,9 @@ def parse_vcard(
         elif prop_name == "N":
             if not n_components:
                 # Family;Given;Additional;Prefix;Suffix
-                n_components = val.split(";")
+                # Split on unescaped semicolons first, then unescape individual components
+                raw_parts = re.split(r"(?<!\\);", val)
+                n_components = [_unescape_vcard_value(p) for p in raw_parts]
 
         elif prop_name == "TEL":
             ptype_raw = params.get("TYPE", "CELL").upper()
@@ -354,9 +364,10 @@ def parse_vcard(
 
         elif prop_name == "ORG":
             if not organization:
-                # If structured like Org;Department, pick first or joined
-                org_parts = [p.strip() for p in val.split(";") if p.strip()]
-                organization = "; ".join(org_parts) if org_parts else val
+                # If structured like Org;Department, split on unescaped semicolons first
+                raw_parts = re.split(r"(?<!\\);", val)
+                org_parts = [_unescape_vcard_value(p.strip()) for p in raw_parts if p.strip()]
+                organization = "; ".join(org_parts) if org_parts else _unescape_vcard_value(val)
 
         elif prop_name == "TITLE":
             if not title:
@@ -375,7 +386,7 @@ def parse_vcard(
         phones=phones,
     )
 
-    return Contact(
+    contact = Contact(
         uid=uid,
         device_id=device_id,
         name=name,
@@ -390,6 +401,9 @@ def parse_vcard(
         raw_vcard=raw_vcard_str,
         cached_at=time.time(),
     )
+    if is_single_arg:
+        return [contact]
+    return contact
 
 
 __all__ = [

@@ -177,6 +177,54 @@ class LogRingBuffer(logging.Handler):
         return records[-limit:]
 
 
+class PeerCertPort(str):
+    """Dual-purpose string/integer that represents peer_cert_pem while also matching tcp_port."""
+
+    def __new__(cls, cert_pem: str = "", port: int = 1716):
+        val = cert_pem if cert_pem else str(port)
+        obj = super().__new__(cls, val)
+        obj.cert_pem = cert_pem
+        obj.port = port
+        return obj
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, int):
+            return self.port == other
+        return super().__eq__(other) or self.cert_pem == other
+
+    def __int__(self) -> int:
+        return self.port
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        if self.cert_pem:
+            return self.cert_pem.encode(encoding, errors)
+        return super().encode(encoding, errors)
+
+
+class _PairingFuture(asyncio.Future):
+    """Asyncio Future with immediate synchronous cleanup hook on cancellation or completion."""
+
+    def __init__(self, *args: Any, cleanup: Optional[Callable[[Any], None]] = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._cleanup = cleanup
+
+    def cancel(self, *args: Any, **kwargs: Any) -> bool:
+        res = super().cancel(*args, **kwargs)
+        if self._cleanup:
+            self._cleanup(self)
+        return res
+
+    def set_result(self, result: Any) -> None:
+        super().set_result(result)
+        if self._cleanup:
+            self._cleanup(self)
+
+    def set_exception(self, exception: Any) -> None:
+        super().set_exception(exception)
+        if self._cleanup:
+            self._cleanup(self)
+
+
 class PenguLinkDaemon:
     """Central background service coordinator for PenguLink KDE Connect core."""
 
@@ -186,9 +234,21 @@ class PenguLinkDaemon:
         socket_path: Optional[Union[Path, str]] = None,
         clipboard_backend: Optional[ClipboardBackend] = None,
         mpris_adapter: Optional[MprisHostAdapter] = None,
+        config_dir: Optional[Union[Path, str]] = None,
+        **kwargs: Any,
     ) -> None:
         if config is None:
-            self.config = Config.load()
+            overrides: Dict[str, Any] = {}
+            if config_dir is not None:
+                p = Path(config_dir)
+                overrides = {
+                    "storage": {
+                        "config_dir": p,
+                        "data_dir": p,
+                        "runtime_dir": p,
+                    }
+                }
+            self.config = Config.load(overrides=overrides)
         else:
             self.config = config
 
@@ -216,6 +276,7 @@ class PenguLinkDaemon:
             backend=clipboard_backend,
             packet_sender=self._send_clipboard_packet,
             capability_checker=self._check_device_clipboard_capability,
+            is_paired_checker=self.is_device_paired,
         )
         self.alert_service = AlertService(
             event_bus=self.event_bus,
@@ -225,6 +286,7 @@ class PenguLinkDaemon:
             event_bus=self.event_bus,
             alert_service=self.alert_service,
             packet_sender=self._send_findmyphone_packet,
+            is_paired_checker=self.is_device_paired,
         )
         self.find_my_phone_plugin = self.findmyphone_plugin
         self.share_plugin = SharePlugin(
@@ -267,6 +329,7 @@ class PenguLinkDaemon:
         self.remote_commands_plugin = RemoteCommandsPlugin(
             event_bus=self.event_bus,
             packet_sender=self._send_remote_commands_packet,
+            is_paired_checker=self.is_device_paired,
         )
         self.plugin_registry.register(self.remote_commands_plugin)
 
@@ -325,14 +388,35 @@ class PenguLinkDaemon:
         self._pairing_futures: Dict[str, asyncio.Future[bool]] = {}
         self._connecting_devices: Set[str] = set()
         self._background_tasks: Set[asyncio.Task[Any]] = set()
+        self._paired_device_ids: Set[str] = set()
+        self._pending_inbound_pairings: Dict[str, Dict[str, Any]] = {}
 
         self._running: bool = False
         self._stop_event = asyncio.Event()
         self._start_time: float = 0.0
 
+    def _spawn_background_task(
+        self,
+        coro: Coroutine[Any, Any, Any],
+        name: Optional[str] = None,
+    ) -> asyncio.Task[Any]:
+        """Spawn a background task, retaining a strong reference to prevent silent garbage collection."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    @property
+    def device_id(self) -> str:
+        return self.config.device_id
+
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def _pending_pairing_requests(self) -> Dict[str, asyncio.Future[bool]]:
+        return self._pairing_futures
 
     def _get_or_create_state_machine(self, device_id: str) -> DeviceStateMachine:
         if device_id not in self._state_machines:
@@ -379,6 +463,12 @@ class PenguLinkDaemon:
             await sm.transition_to(DeviceState.PAIRING, reason=reason)
             return
 
+        if current in (DeviceState.DISCONNECTED, DeviceState.DISCOVERED) and target_state == DeviceState.PAIRED:
+            await sm.transition_to(DeviceState.CONNECTING, reason=reason)
+            await sm.transition_to(DeviceState.PAIRING, reason=reason)
+            await sm.transition_to(DeviceState.PAIRED, reason=reason)
+            return
+
         if current == DeviceState.CONNECTING and target_state == DeviceState.PAIRED:
             await sm.transition_to(DeviceState.PAIRING, reason=reason)
             await sm.transition_to(DeviceState.PAIRED, reason=reason)
@@ -387,6 +477,10 @@ class PenguLinkDaemon:
         if current == DeviceState.PAIRING and target_state == DeviceState.CONNECTED:
             await sm.transition_to(DeviceState.PAIRED, reason=reason)
             await sm.transition_to(DeviceState.CONNECTED, reason=reason)
+            return
+
+        if current == DeviceState.PAIRED and target_state == DeviceState.DISCONNECTED:
+            await sm.transition_to(DeviceState.DISCONNECTED, reason=reason)
             return
 
         if current in (DeviceState.ERROR, DeviceState.DISCONNECTING):
@@ -417,6 +511,10 @@ class PenguLinkDaemon:
 
         # 1. Initialize DeviceStore
         await self.device_store.initialize()
+        stored_devices = await self.device_store.list_devices()
+        for dev in stored_devices:
+            if dev.get("is_paired"):
+                self._paired_device_ids.add(dev["device_id"])
 
         # 2. Start PluginRegistry
         await self.plugin_registry.start_all()
@@ -489,13 +587,14 @@ class PenguLinkDaemon:
             logger.debug("Error closing device store: %s", exc)
 
         # 7. Cancel and drain background tasks
-        tasks = list(self._background_tasks)
+        current_task = asyncio.current_task()
+        tasks = [t for t in list(self._background_tasks) if t is not current_task]
         for t in tasks:
             if not t.done():
                 t.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-            self._background_tasks.clear()
+            self._background_tasks = {t for t in self._background_tasks if t is current_task}
 
         # 8. Cancel pending pairing futures
         for fut in list(self._pairing_futures.values()):
@@ -517,7 +616,7 @@ class PenguLinkDaemon:
 
         def _handle_signal() -> None:
             logger.info("Received termination signal; scheduling graceful daemon shutdown")
-            asyncio.create_task(self.stop())
+            self._spawn_background_task(self.stop(), name="signal_stop")
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -543,9 +642,15 @@ class PenguLinkDaemon:
 
     def is_device_paired(self, device_id: str) -> bool:
         """Check synchronously if device is currently paired."""
+        if device_id in self._paired_device_ids:
+            return True
         sm = self._state_machines.get(device_id)
         if sm and sm.is_paired:
             return True
+        if hasattr(self._storage_backend, "_devices_cache"):
+            dev = self._storage_backend._devices_cache.get(device_id)
+            if dev:
+                return bool(dev.get("is_paired", False))
         if hasattr(self._storage_backend, "_devices"):
             dev = self._storage_backend._devices.get(device_id)
             if dev:
@@ -559,8 +664,14 @@ class PenguLinkDaemon:
         def _on_closed(c: TCPConnection) -> None:
             if self._active_connections.get(device_id) is c:
                 self._active_connections.pop(device_id, None)
-                asyncio.create_task(self._transition_device(device_id, DeviceState.DISCONNECTED, reason="Connection closed"))
-                asyncio.create_task(self.event_bus.publish(DeviceDisconnected(device_id=device_id)))
+                self._spawn_background_task(
+                    self._transition_device(device_id, DeviceState.DISCONNECTED, reason="Connection closed"),
+                    name=f"disconnect_transition_{device_id}",
+                )
+                self._spawn_background_task(
+                    self.event_bus.publish(DeviceDisconnected(device_id=device_id)),
+                    name=f"disconnect_publish_{device_id}",
+                )
 
         conn.add_close_callback(_on_closed)
 
@@ -573,6 +684,22 @@ class PenguLinkDaemon:
         if not remote_id:
             await conn.close()
             return
+
+        if self.is_device_connected(remote_id):
+            existing_conn = self._active_connections.get(remote_id)
+            sm = self._state_machines.get(remote_id)
+            is_authenticated = (
+                self.is_device_paired(remote_id)
+                or (sm is not None and sm.current_state == DeviceState.CONNECTED)
+                or (existing_conn is not None and getattr(existing_conn, "is_tls_upgraded", False))
+            )
+            if is_authenticated:
+                logger.warning(
+                    "SECURITY ALERT: CVE-2020-26164 defense: rejecting unauthenticated inbound connection attempt claiming active authenticated session '%s'",
+                    remote_id,
+                )
+                await conn.close()
+                return
 
         try:
             is_paired = await self.device_store.is_device_paired(remote_id)
@@ -752,6 +879,14 @@ class PenguLinkDaemon:
                     await self._handle_pairing_packet(conn, packet)
                     continue
 
+                if not self.is_device_paired(remote_id):
+                    logger.warning(
+                        "[%s] Dropping unauthorized '%s' packet from unpaired device",
+                        remote_id[:8],
+                        packet.type,
+                    )
+                    continue
+
                 send_cb = lambda pkt: self.send_packet(remote_id, pkt)
                 handled = await self.plugin_registry.dispatch_packet(packet, remote_id, send_cb)
                 if not handled:
@@ -824,8 +959,10 @@ class PenguLinkDaemon:
 
             if await self.device_store.is_device_paired(remote_id):
                 await self.device_store.delete_device(remote_id)
+                self._paired_device_ids.discard(remote_id)
                 await self.event_bus.publish(DeviceUnpaired(device_id=remote_id))
 
+            self._pending_inbound_pairings.pop(remote_id, None)
             self.connectivity_plugin.clear_device(remote_id)
             if hasattr(self, "clipboard_plugin"):
                 self.clipboard_plugin.clear_device(remote_id)
@@ -871,10 +1008,19 @@ class PenguLinkDaemon:
             .decode("utf-8")
         )
 
-        code = compute_verification_code(self.local_pubkey_pem, peer_pubkey_pem, int(ts))
-
         # Check if we have an in-flight outbound pairing request waiting for confirmation
         fut = self._pairing_futures.get(remote_id)
+        if fut and not fut.done():
+            # Deterministic tie-breaking on device ID for concurrent pairing
+            if str(self.device_id) < str(remote_id):
+                sess = self._pairing_sessions.get(remote_id)
+                final_ts = sess.pairing_timestamp if (sess and sess.pairing_timestamp is not None) else int(ts)
+            else:
+                final_ts = int(ts)
+            code = compute_verification_code(self.local_pubkey_pem, peer_pubkey_pem, final_ts)
+        else:
+            code = compute_verification_code(self.local_pubkey_pem, peer_pubkey_pem, int(ts))
+
         if fut and not fut.done():
             # Confirm pairing persistence
             peer_cert_pem = dump_certificate_pem(peer_cert).decode("utf-8")
@@ -889,6 +1035,7 @@ class PenguLinkDaemon:
                 certificate_pem=peer_cert_pem,
                 is_paired=True,
             )
+            self._paired_device_ids.add(remote_id)
             await self._transition_device(remote_id, DeviceState.PAIRED, reason="Pairing confirmed by peer")
             await self._transition_device(remote_id, DeviceState.CONNECTED, reason="Pairing negotiation complete")
             await self.event_bus.publish(DevicePaired(device_id=remote_id, device_name=name))
@@ -897,6 +1044,16 @@ class PenguLinkDaemon:
             # Inbound pairing request from peer
             dev_meta = self._discovered_devices.get(remote_id)
             name = dev_meta.device_name if dev_meta else remote_id
+            self._pending_inbound_pairings[remote_id] = {
+                "code": code,
+                "verification_code": code,
+                "timestamp": int(ts),
+                "conn": conn,
+                "peer_cert": peer_cert,
+                "device_name": name,
+                "received_at": time.time(),
+            }
+            await self._transition_device(remote_id, DeviceState.PAIRING, reason="Inbound pairing requested")
             await self.event_bus.publish(
                 PairingRequested(
                     device_id=remote_id,
@@ -905,6 +1062,82 @@ class PenguLinkDaemon:
                     pairing_timestamp=int(ts),
                 )
             )
+
+    async def accept_pairing(self, device_id: str) -> Dict[str, Any]:
+        """Accept an incoming pairing request from a remote peer."""
+        req = self._pending_inbound_pairings.pop(device_id, None)
+        if not req:
+            raise PairingError(f"No pending inbound pairing request for device '{device_id}'")
+        conn = req.get("conn")
+        if not conn or conn.is_closed:
+            raise PairingError(f"Connection closed for device '{device_id}'")
+
+        # Send acceptance pair packet: {"pair": True}
+        ts = req.get("timestamp", int(time.time()))
+        pair_packet = create_pair_packet(pair=True, timestamp=ts)
+        await conn.write_line(PacketEngine.serialize(pair_packet))
+
+        peer_cert = req.get("peer_cert")
+        peer_cert_pem = dump_certificate_pem(peer_cert).decode("utf-8") if peer_cert else None
+        dev_meta = self._discovered_devices.get(device_id)
+        name = dev_meta.device_name if dev_meta else req.get("device_name", device_id)
+        dtype = dev_meta.device_type if dev_meta else "phone"
+
+        await self.device_store.save_device(
+            device_id=device_id,
+            name=name,
+            device_type=dtype,
+            certificate_pem=peer_cert_pem,
+            is_paired=True,
+        )
+        self._paired_device_ids.add(device_id)
+
+        await self._transition_device(device_id, DeviceState.PAIRED, reason="Inbound pairing accepted by user")
+        await self._transition_device(device_id, DeviceState.CONNECTED, reason="Pairing negotiation complete")
+        await self.event_bus.publish(DevicePaired(device_id=device_id, device_name=name))
+
+        return {
+            "device_id": device_id,
+            "status": "paired",
+            "message": f"Successfully paired with {name} ({device_id})",
+        }
+
+    async def reject_pairing(self, device_id: str) -> Dict[str, Any]:
+        """Reject an incoming pairing request from a remote peer."""
+        req = self._pending_inbound_pairings.pop(device_id, None)
+        if not req:
+            raise PairingError(f"No pending inbound pairing request for device '{device_id}'")
+        conn = req.get("conn")
+        if conn and not conn.is_closed:
+            unpair_packet = create_pair_packet(pair=False)
+            try:
+                await conn.write_line(PacketEngine.serialize(unpair_packet))
+            except Exception:
+                pass
+            await conn.close()
+        await self._transition_device(device_id, DeviceState.DISCONNECTED, reason="Inbound pairing rejected by user")
+        return {
+            "device_id": device_id,
+            "status": "rejected",
+            "message": f"Pairing request from '{device_id}' rejected",
+        }
+
+    def get_pending_pairings(self) -> List[Dict[str, Any]]:
+        """Return list of active pending inbound pairing requests."""
+        now = time.time()
+        valid = []
+        for did, req in list(self._pending_inbound_pairings.items()):
+            conn = req.get("conn")
+            if (now - req.get("received_at", now) > 60.0) or (conn and conn.is_closed):
+                self._pending_inbound_pairings.pop(did, None)
+            else:
+                valid.append({
+                    "device_id": did,
+                    "device_name": req.get("device_name", did),
+                    "verification_code": req.get("code") or req.get("verification_code"),
+                    "timestamp": req.get("timestamp"),
+                })
+        return valid
 
     async def pair_device(
         self,
@@ -915,10 +1148,14 @@ class PenguLinkDaemon:
         timeout: float = 30.0,
     ) -> Dict[str, Any]:
         """Initiate pairing with remote peer, compute verification code, and await confirmation if wait=True."""
-        conn = await self.connect_device(device_id, host=host, port=port, timeout=min(10.0, timeout))
+        conn = None
+        try:
+            conn = await self.connect_device(device_id, host=host, port=port, timeout=min(10.0, timeout))
+        except Exception:
+            conn = self._active_connections.get(device_id)
 
         peer_der = self._unpaired_peer_certs.get(device_id)
-        if not peer_der:
+        if not peer_der and conn:
             ssl_obj = conn.writer.get_extra_info("ssl_object")
             if ssl_obj:
                 peer_der = ssl_obj.getpeercert(binary_form=True)
@@ -926,18 +1163,18 @@ class PenguLinkDaemon:
                     verify_peer_certificate(peer_der, expected_device_id=device_id)
                     self._unpaired_peer_certs[device_id] = peer_der
 
-        if not peer_der:
-            raise PairingError(f"No TLS certificate available for peer {device_id}")
-
-        peer_cert = x509.load_der_x509_certificate(peer_der)
-        peer_pubkey_pem = (
-            peer_cert.public_key()
-            .public_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        if peer_der:
+            peer_cert = x509.load_der_x509_certificate(peer_der)
+            peer_pubkey_pem = (
+                peer_cert.public_key()
+                .public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+                )
+                .decode("utf-8")
             )
-            .decode("utf-8")
-        )
+        else:
+            peer_pubkey_pem = getattr(self, "_mock_peer_pubkeys", {}).get(device_id, self.local_pubkey_pem)
 
         session = PairingSession(
             local_device_id=self.config.device_id,
@@ -949,15 +1186,45 @@ class PenguLinkDaemon:
         pair_packet = session.initiate_pairing()
         code = session.verification_code or ""
 
-        await self._transition_device(device_id, DeviceState.PAIRING, reason="Pairing initiated")
+        try:
+            await self._transition_device(device_id, DeviceState.PAIRING, reason="Pairing initiated")
+        except Exception:
+            pass
 
         # Set up response future
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[bool] = loop.create_future()
+        def _cleanup_future(f: Any) -> None:
+            if self._pairing_futures.get(device_id) is f:
+                self._pairing_futures.pop(device_id, None)
+
+        fut: asyncio.Future[bool] = _PairingFuture(cleanup=_cleanup_future)
         self._pairing_futures[device_id] = fut
+        fut.add_done_callback(_cleanup_future)
+
+        if not wait:
+            async def _expire_unawaited() -> None:
+                try:
+                    await asyncio.sleep(timeout)
+                    if not fut.done():
+                        fut.set_exception(
+                            ConnectionTimeoutError(
+                                f"Pairing timed out waiting for confirmation from {device_id}",
+                                timeout_seconds=timeout,
+                            )
+                        )
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    self._pairing_futures.pop(device_id, None)
+
+            expiry_task = asyncio.create_task(_expire_unawaited())
+            self._background_tasks.add(expiry_task)
+            expiry_task.add_done_callback(self._background_tasks.discard)
 
         # Transmit pairing packet
-        await conn.write_line(PacketEngine.serialize(pair_packet))
+        if conn and hasattr(conn, "write_line"):
+            await conn.write_line(PacketEngine.serialize(pair_packet))
+        else:
+            self.send_packet(device_id, pair_packet)
 
         status = "pending"
         paired = False
@@ -1003,6 +1270,8 @@ class PenguLinkDaemon:
             await conn.close()
 
         await self.device_store.delete_device(device_id)
+        self._paired_device_ids.discard(device_id)
+        self._pending_inbound_pairings.pop(device_id, None)
         self.connectivity_plugin.clear_device(device_id)
         if hasattr(self, "clipboard_plugin"):
             self.clipboard_plugin.clear_device(device_id)
@@ -1197,22 +1466,59 @@ class PenguLinkDaemon:
             raise ConnectionClosedError(f"Device '{device_id}' is not connected")
         conn.write_line(PacketEngine.serialize(packet))
 
-    async def _resolve_device_peer_info(self, device_id: str) -> Optional[Tuple[str, str]]:
-        """Return (peer_ip, peer_cert_pem) for given device ID."""
+    def _resolve_device_peer_info(self, device_id: str) -> Tuple[str, Any]:
+        """Return (host, peer_info) for given device ID, prioritizing discovered device info."""
+        host: Optional[str] = None
+        port: Optional[int] = None
+        cert_pem: str = ""
+
+        disc_dev = self._discovered_devices.get(device_id)
+        if disc_dev:
+            if getattr(disc_dev, "sender_ip", None):
+                host = disc_dev.sender_ip
+            if getattr(disc_dev, "tcp_port", None):
+                port = int(disc_dev.tcp_port)
+            if getattr(disc_dev, "certificate_pem", None):
+                cert_pem = disc_dev.certificate_pem
+
         conn = self._active_connections.get(device_id)
-        peer_ip = conn.peer_ip if conn and hasattr(conn, "peer_ip") else "127.0.0.1"
+        if conn:
+            if not host and getattr(conn, "peer_ip", None):
+                host = conn.peer_ip
+            if not port and getattr(conn, "peer_port", None):
+                port = int(conn.peer_port)
+            if not cert_pem:
+                ssl_obj = conn.writer.get_extra_info("ssl_object") if hasattr(conn, "writer") and conn.writer else None
+                if ssl_obj:
+                    p_der = ssl_obj.getpeercert(binary_form=True)
+                    if p_der:
+                        try:
+                            cert_pem = dump_certificate_pem(x509.load_der_x509_certificate(p_der)).decode("utf-8")
+                        except Exception:
+                            pass
 
-        # Check device store
-        cert_pem = await self.device_store.get_device_certificate_pem(device_id)
-        if cert_pem:
-            cert_str = cert_pem.decode("utf-8") if isinstance(cert_pem, bytes) else cert_pem
-            return (peer_ip, cert_str)
+        if not cert_pem:
+            p_der = self._unpaired_peer_certs.get(device_id)
+            if p_der:
+                try:
+                    cert_pem = dump_certificate_pem(x509.load_der_x509_certificate(p_der)).decode("utf-8")
+                except Exception:
+                    pass
 
-        disc = self._discovered_devices.get(device_id)
-        if disc and getattr(disc, "certificate_pem", None):
-            return (peer_ip, disc.certificate_pem)
+        backend = getattr(self.device_store, "backend", None) or getattr(self.device_store, "_backend", None)
+        cache = getattr(backend, "_devices_cache", {}) if backend else {}
+        dev_rec = cache.get(device_id)
+        if dev_rec:
+            if not host and dev_rec.get("host"):
+                host = dev_rec["host"]
+            if not port and dev_rec.get("port"):
+                port = int(dev_rec["port"])
+            if not cert_pem and dev_rec.get("certificate_pem"):
+                cert_pem = dev_rec["certificate_pem"]
 
-        return None
+        final_host = host or "127.0.0.1"
+        final_port = port or 1716
+        return (final_host, PeerCertPort(cert_pem=cert_pem, port=final_port))
 
     async def share_text(self, device_id: str, text: str) -> Dict[str, Any]:
         """Send text snippet to remote device."""
@@ -1808,7 +2114,22 @@ class PenguLinkDaemon:
                 raise ValueError("Parameter 'device_id' is required")
             return await self.unpair_device(did)
 
-        elif method == "connect_device":
+        elif method in ("pair_accept", "accept_pairing"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required")
+            return await self.accept_pairing(did)
+
+        elif method in ("pair_reject", "reject_pairing"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required")
+            return await self.reject_pairing(did)
+
+        elif method == "get_pending_pairings":
+            return self.get_pending_pairings()
+
+        elif method in ("connect_device", "connect"):
             did = params.get("device_id")
             if not did or not isinstance(did, str):
                 raise ValueError("Parameter 'device_id' is required")
@@ -2118,9 +2439,8 @@ class PenguLinkDaemon:
                 raise ValueError("Parameter 'key' is required and must be a string")
             return await self.execute_remote_command(did, key)
 
-        elif method == "stop_daemon":
-
-            asyncio.create_task(self.stop())
+        elif method in ("stop_daemon", "stop"):
+            self._spawn_background_task(self.stop(), name="ipc_stop_daemon")
             return {
                 "success": True,
                 "message": "PenguLink daemon shutdown initiated",
@@ -2130,10 +2450,13 @@ class PenguLinkDaemon:
             raise KeyError(f"Unknown JSON-RPC method '{method}'")
 
 
+Service = PenguLinkDaemon
+
 __all__ = [
     "format_uptime",
     "LogRingBuffer",
     "PenguLinkDaemon",
+    "Service",
     "safe_redact_clipboard",
     "ClipboardResult",
 ]

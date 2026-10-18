@@ -177,7 +177,7 @@ class FindMyPhonePlugin(Plugin):
                     "FindMyPhonePlugin rejecting locate packet from unauthenticated/unpaired device '%s'",
                     _sanitize_log_str(device_id),
                 )
-                return
+                return True
 
         async with self._lock:
             currently_active = self._is_alert_active()

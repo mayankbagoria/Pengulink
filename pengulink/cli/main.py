@@ -272,11 +272,35 @@ def devices(ctx: click.Context) -> None:
 # Pairing and Connection Management Commands
 # =====================================================================
 
-@cli.command(name="pair", help="Initiate pairing handshake with a remote device.")
+class PairGroup(click.Group):
+    """Click group for pairing operations that defaults to initiating outbound pairing if no subcommand is given."""
+
+    def resolve_command(self, ctx: click.Context, args: list) -> tuple:
+        cmd_name = click.utils.make_str(args[0]) if args else None
+        if cmd_name in self.commands:
+            return super().resolve_command(ctx, args)
+        if not args or args[0] in ("--help", "-h"):
+            return super().resolve_command(ctx, args)
+        cmd = self.get_command(ctx, "request")
+        return "request", cmd, args
+
+    def parse_args(self, ctx: click.Context, args: list) -> list:
+        if not args or (args[0] not in self.commands and args[0] not in ("--help", "-h")):
+            args = ["request"] + list(args)
+        return super().parse_args(ctx, args)
+
+
+@cli.group(name="pair", cls=PairGroup, invoke_without_command=False, help="Initiate or manage pairing handshake with remote devices.")
+def pair() -> None:
+    """Pairing command group for initiating, accepting, or rejecting device pairing."""
+    pass
+
+
+@pair.command(name="request", help="Initiate pairing handshake with a remote device.")
 @click.argument("device_id", type=str)
 @click.option("--timeout", "-t", type=float, default=30.0, show_default=True, help="Pairing timeout (seconds).")
 @click.pass_context
-def pair(ctx: click.Context, device_id: str, timeout: float) -> None:
+def pair_request(ctx: click.Context, device_id: str, timeout: float) -> None:
     """Initiate pairing, render 8-character verification code in a Rich panel, and await outcome."""
     result = run_ipc_call(
         ctx,
@@ -342,6 +366,71 @@ def pair(ctx: click.Context, device_id: str, timeout: float) -> None:
                 sys.exit(1)
 
 
+@pair.command(name="accept", help="Accept an incoming pairing request from a remote device.")
+@click.argument("device_id", type=str)
+@click.pass_context
+def pair_accept(ctx: click.Context, device_id: str) -> None:
+    """Accept an inbound pairing request from device_id."""
+    result = run_ipc_call(
+        ctx,
+        "pair_accept",
+        {"device_id": device_id},
+    )
+    if ctx.obj.get("json_output"):
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    msg = result.get("message", f"Accepted pairing with {device_id}")
+    console.print(f"[bold green]✓ {msg}[/]")
+
+
+@pair.command(name="reject", help="Reject an incoming pairing request from a remote device.")
+@click.argument("device_id", type=str)
+@click.pass_context
+def pair_reject(ctx: click.Context, device_id: str) -> None:
+    """Reject an inbound pairing request from device_id."""
+    result = run_ipc_call(
+        ctx,
+        "pair_reject",
+        {"device_id": device_id},
+    )
+    if ctx.obj.get("json_output"):
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    msg = result.get("message", f"Rejected pairing from {device_id}")
+    console.print(f"[bold yellow]✗ {msg}[/]")
+
+
+@pair.command(name="requests", help="List active pending inbound pairing requests.")
+@click.pass_context
+def pair_requests(ctx: click.Context) -> None:
+    """List pending inbound pairing requests awaiting user confirmation."""
+    result = run_ipc_call(ctx, "get_pending_pairings", {})
+    if ctx.obj.get("json_output"):
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    if not result:
+        console.print("[dim]No pending inbound pairing requests.[/]")
+        return
+
+    table = Table(title="Pending Inbound Pairing Requests", box=box.ROUNDED)
+    table.add_column("Device ID", style="cyan")
+    table.add_column("Device Name", style="white")
+    table.add_column("Verification Code", style="bold yellow")
+    table.add_column("Action", style="green")
+
+    for req in result:
+        table.add_row(
+            req.get("device_id", ""),
+            req.get("device_name", ""),
+            req.get("verification_code", ""),
+            f"pengulink pair accept {req.get('device_id')}",
+        )
+    console.print(table)
+
+
 @cli.command(name="unpair", help="Unpair a device and revoke trust.")
 @click.argument("device_id", type=str)
 @click.option("--yes", "-y", is_flag=True, default=False, help="Confirm without prompting.")
@@ -363,16 +452,42 @@ def unpair(ctx: click.Context, device_id: str, yes: bool) -> None:
 @cli.command(name="connect", help="Trigger manual connection to a device.")
 @click.argument("device_id", type=str)
 @click.option("--timeout", "-t", type=float, default=10.0, show_default=True, help="Connection timeout.")
+@click.option("--host", "-h", type=str, default=None, help="Target host/IP address override.")
+@click.option("--port", "-p", type=int, default=None, help="Target TCP port override.")
 @click.pass_context
-def connect(ctx: click.Context, device_id: str, timeout: float) -> None:
+def connect(
+    ctx: click.Context,
+    device_id: str,
+    timeout: float,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+) -> None:
     """Manually initiate connection to a device."""
+    payload: Dict[str, Any] = {"device_id": device_id}
+    if host is not None:
+        payload["host"] = host
+    if port is not None:
+        payload["port"] = int(port)
+    if timeout != 10.0:
+        payload["timeout"] = timeout
+
+    socket_path = resolve_socket_path(ctx)
+    client = PenguLinkIPCClient(socket_path=socket_path)
+
     with console.status(f"[bold cyan]Connecting to device '{device_id}'...[/]"):
-        result = run_ipc_call(
-            ctx,
-            "connect_device",
-            {"device_id": device_id, "timeout": timeout},
-            timeout=timeout + 5.0,
-        )
+        try:
+            result = client.call_sync("connect", payload)
+        except DaemonNotRunningError:
+            console.print(
+                "PenguLink daemon is not running. Start with 'pengulink daemon run' or start the background service."
+            )
+            sys.exit(1)
+        except IPCError as exc:
+            console.print(f"[bold red]IPC Error:[/] {exc}")
+            sys.exit(1)
+        except Exception as exc:
+            console.print(f"[bold red]Unexpected Error:[/] {exc}")
+            sys.exit(1)
 
     if ctx.obj.get("json_output"):
         click.echo(json.dumps(result, indent=2))
@@ -607,9 +722,13 @@ def daemon_run(config: Optional[Path], socket_path: Optional[Path], log_level: O
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    _daemon_shutdown_tasks: set[asyncio.Task[Any]] = set()
+
     def _signal_handler() -> None:
         console.print("\n[yellow]Shutdown signal received. Stopping PenguLink daemon...[/]")
-        loop.create_task(daemon_inst.stop())
+        task = loop.create_task(daemon_inst.stop())
+        _daemon_shutdown_tasks.add(task)
+        task.add_done_callback(_daemon_shutdown_tasks.discard)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -672,6 +791,28 @@ def daemon_status(ctx: click.Context) -> None:
             box=box.ROUNDED,
         )
     )
+
+
+@daemon.command(name="stop", help="Stop running PenguLink background daemon.")
+@click.pass_context
+def daemon_stop(ctx: click.Context) -> None:
+    """Request running daemon to stop cleanly via IPC."""
+    socket_path = resolve_socket_path(ctx)
+    client = PenguLinkIPCClient(socket_path=socket_path)
+    try:
+        res = client.call_sync("stop_daemon")
+    except (DaemonNotRunningError, FileNotFoundError, ConnectionRefusedError):
+        console.print("[yellow]PenguLink daemon is not running.[/]")
+        sys.exit(1)
+    except Exception as exc:
+        console.print(f"[bold red]Failed to stop daemon:[/] {exc}")
+        sys.exit(1)
+
+    if ctx.obj.get("json_output"):
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    console.print("[bold green]Daemon stopped successfully.[/]")
 
 
 # =====================================================================

@@ -141,23 +141,48 @@ def load_certificate_pem(data: bytes) -> x509.Certificate:
 
 
 def save_credentials(
-    storage_dir: Union[str, Path],
-    private_key: rsa.RSAPrivateKey,
-    certificate: x509.Certificate,
+    storage_dir_or_cert: Union[str, Path, x509.Certificate],
+    private_key_or_key: rsa.RSAPrivateKey,
+    certificate_or_cert_path: Union[x509.Certificate, str, Path],
+    key_path_arg: Optional[Union[str, Path]] = None,
 ) -> Tuple[Path, Path]:
-    """Persist private key and certificate atomically with strict POSIX 0600 permissions."""
-    target_dir = Path(storage_dir)
-    target_dir.mkdir(parents=True, exist_ok=True)
+    """Persist private key and certificate atomically with strict POSIX 0600 permissions.
 
-    key_path = target_dir / "private_key.pem"
-    cert_path = target_dir / "certificate.pem"
+    Supports both signatures:
+      save_credentials(storage_dir, private_key, certificate)
+      save_credentials(certificate, private_key, cert_path, key_path)
+    """
+    if isinstance(storage_dir_or_cert, x509.Certificate):
+        certificate = storage_dir_or_cert
+        private_key = private_key_or_key
+        cert_path = Path(certificate_or_cert_path)
+        key_path = Path(key_path_arg) if key_path_arg is not None else cert_path.with_name("private_key.pem")
+        target_dir = key_path.parent
+    else:
+        target_dir = Path(storage_dir_or_cert)
+        private_key = private_key_or_key
+        certificate = certificate_or_cert_path  # type: ignore[assignment]
+        key_path = target_dir / "private_key.pem"
+        cert_path = target_dir / "certificate.pem"
+
+    target_dir.mkdir(parents=True, exist_ok=True)
 
     key_pem = dump_private_key_pem(private_key)
     cert_pem = dump_certificate_pem(certificate)
 
     # 1. Write private key atomically with 0600 permissions
-    tmp_key = key_path.with_suffix(".tmp")
-    tmp_key.write_bytes(key_pem)
+    tmp_key = key_path.with_suffix(f".tmp.{os.getpid()}")
+    fd = os.open(tmp_key, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        with open(fd, "wb", closefd=True) as f:
+            f.write(key_pem)
+            f.flush()
+    except Exception:
+        try:
+            os.unlink(tmp_key)
+        except OSError:
+            pass
+        raise
     try:
         os.chmod(tmp_key, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     except OSError as exc:
@@ -171,8 +196,18 @@ def save_credentials(
         pass
 
     # 2. Write certificate atomically with 0644 permissions
-    tmp_cert = cert_path.with_suffix(".tmp")
-    tmp_cert.write_bytes(cert_pem)
+    tmp_cert = cert_path.with_suffix(f".tmp.{os.getpid()}")
+    fd_cert = os.open(tmp_cert, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    try:
+        with open(fd_cert, "wb", closefd=True) as fc:
+            fc.write(cert_pem)
+            fc.flush()
+    except Exception:
+        try:
+            os.unlink(tmp_cert)
+        except OSError:
+            pass
+        raise
     try:
         os.chmod(tmp_cert, 0o644)
     except OSError:
@@ -248,3 +283,30 @@ def ensure_credentials(
     cert = generate_self_signed_cert(key, device_id)
     save_credentials(target_dir, key, cert)
     return key, cert
+
+
+def save_private_key(key: rsa.RSAPrivateKey, path: Union[str, Path]) -> Path:
+    """Save RSA private key atomically with strict 0600 permissions."""
+    key_path = Path(path)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_pem = dump_private_key_pem(key)
+
+    tmp_key = key_path.with_suffix(f".tmp.{os.getpid()}")
+    fd = os.open(str(tmp_key), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, key_pem)
+    finally:
+        os.close(fd)
+
+    try:
+        os.chmod(tmp_key, 0o600)
+    except OSError:
+        pass
+    tmp_key.replace(key_path)
+
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+    return key_path
+

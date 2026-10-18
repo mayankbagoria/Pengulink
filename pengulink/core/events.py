@@ -214,12 +214,20 @@ class EventBus:
         """
         handlers: List[EventHandler] = []
 
+        # Snapshot subscribers under lock to prevent RuntimeError from concurrent dict mutation
+        async with self._lock:
+            subscribers_snapshot = [
+                (registered_type, list(handler_list))
+                for registered_type, handler_list in list(self._subscribers.items())
+            ]
+            global_snapshot = list(self._global_subscribers)
+
         # Find exact matches and subclass matches
-        for registered_type, handler_list in self._subscribers.items():
+        for registered_type, handler_list in subscribers_snapshot:
             if isinstance(event, registered_type):
                 handlers.extend(handler_list)
 
-        handlers.extend(self._global_subscribers)
+        handlers.extend(global_snapshot)
 
         if not handlers:
             return

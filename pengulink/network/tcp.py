@@ -22,6 +22,7 @@ from pengulink.core.exceptions import (
     LimitOverrunError,
     PortBindingError,
     TLSUpgradeError,
+    TruncatedPacketError,
 )
 from pengulink.network.packet import MAX_PACKET_SIZE, IdentityBody, Packet
 
@@ -92,6 +93,7 @@ class TCPConnection:
         self.last_activity: float = time.time()
         self._closed: bool = False
         self._close_callbacks: list[Callable[[TCPConnection], Any]] = []
+        self._close_tasks: Set[asyncio.Task[Any]] = set()
 
         configure_stream_socket(
             self.writer,
@@ -106,7 +108,9 @@ class TCPConnection:
             try:
                 res = cb(self)
                 if asyncio.iscoroutine(res):
-                    asyncio.create_task(res)
+                    task = asyncio.create_task(res)
+                    self._close_tasks.add(task)
+                    task.add_done_callback(self._close_tasks.discard)
             except Exception as exc:
                 logger.debug("Error in immediate close callback: %s", exc)
             return
@@ -130,6 +134,15 @@ class TCPConnection:
             if not line:
                 await self.close()
                 return b""  # Clean EOF
+            if not line.endswith(b"\n"):
+                logger.warning(
+                    "Truncated line received at stream EOF from %s:%d (%d bytes)",
+                    self.peer_ip,
+                    self.peer_port,
+                    len(line),
+                )
+                await self.close()
+                raise TruncatedPacketError("Stream reached EOF before newline delimiter was received")
             self.last_activity = time.time()
             return line
         except (asyncio.LimitOverrunError, ValueError) as exc:
@@ -216,6 +229,14 @@ class TCPConnection:
         if self._closed or self.is_tls_upgraded:
             return
 
+        if hasattr(self.reader, "_buffer") and len(self.reader._buffer) > 0:
+            logger.error(
+                "SECURITY ALERT: STARTTLS injection attempt detected (%d buffered bytes)",
+                len(self.reader._buffer),
+            )
+            await self.close()
+            raise TLSUpgradeError("STARTTLS injection: unconsumed cleartext bytes in stream buffer")
+
         loop = asyncio.get_running_loop()
         try:
             transport = self.writer.transport
@@ -229,6 +250,15 @@ class TCPConnection:
                 ),
                 timeout=timeout,
             )
+
+            if hasattr(self.reader, "_buffer") and len(self.reader._buffer) > 0:
+                logger.error(
+                    "SECURITY ALERT: STARTTLS injection attempt detected post-handshake (%d buffered bytes)",
+                    len(self.reader._buffer),
+                )
+                await self.close()
+                raise TLSUpgradeError("STARTTLS injection: unconsumed cleartext bytes in stream buffer")
+
             # Rebind underlying transport in StreamWriter
             self.writer._transport = new_transport
             self.is_tls_upgraded = True
@@ -239,6 +269,8 @@ class TCPConnection:
                 self.peer_port,
                 server_side,
             )
+        except TLSUpgradeError:
+            raise
         except Exception as exc:
             logger.error("TLS upgrade failed for %s:%d: %s", self.peer_ip, self.peer_port, exc)
             await self.close()
@@ -264,7 +296,9 @@ class TCPConnection:
                 try:
                     res = cb(self)
                     if asyncio.iscoroutine(res):
-                        asyncio.create_task(res)
+                        task = asyncio.create_task(res)
+                        self._close_tasks.add(task)
+                        task.add_done_callback(self._close_tasks.discard)
                 except Exception as exc:
                     logger.debug("Error in TCPConnection close callback: %s", exc)
             self._close_callbacks.clear()
@@ -416,6 +450,11 @@ class TCPStreamManager:
         # 1. Stop accepting new incoming connections immediately
         if server:
             server.close()
+            if hasattr(server, "close_clients"):
+                try:
+                    server.close_clients()
+                except Exception:
+                    pass
 
         # 2. Cancel and drain in-flight connection handlers
         for task in list(self._pending_tasks):
@@ -601,13 +640,30 @@ class TCPStreamManager:
         if not existing or existing.is_closed:
             return False
 
-        local_id = self._get_device_id()
-        if local_id > remote_device_id:
+        # CVE-2020-26164 Defense: Never allow an unauthenticated inbound collision to drop an active TLS session
+        if getattr(existing, "is_tls_upgraded", False):
+            return True
+
+        local_id = str(self._get_device_id())
+        remote_id = str(remote_device_id) if remote_device_id is not None else ""
+        if local_id > remote_id:
             return True  # Local wins: keep outbound, reject inbound
         else:
             # Remote wins: terminate older connection and accept this inbound one
-            asyncio.create_task(existing.close())
+            task = asyncio.create_task(existing.close())
+            self._pending_tasks.add(task)
+            task.add_done_callback(self._pending_tasks.discard)
             return False
+
+
+def _should_drop_inbound_collision(local_device_id: Any, remote_device_id: Any) -> bool:
+    """Deterministic tie-breaker comparison between two device IDs.
+
+    Enforces type conversion to str to prevent TypeError on mixed/non-string types.
+    Returns True if inbound collision should be dropped (str(local) < str(remote)),
+    otherwise False.
+    """
+    return str(local_device_id) < str(remote_device_id)
 
 
 # Alias for TcpStreamManager
@@ -619,4 +675,6 @@ __all__ = [
     "TCPConnection",
     "TCPStreamManager",
     "TcpStreamManager",
+    "_should_drop_inbound_collision",
 ]
+

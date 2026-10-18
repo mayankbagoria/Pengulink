@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import array
 import asyncio
+import collections
 import fcntl
+import inspect
 import json
 import logging
 import socket
@@ -67,8 +69,10 @@ def get_broadcast_addresses() -> Set[str]:
             out_len, _ = struct.unpack("iP", res)
             raw = arr.tobytes()[:out_len]
 
-            for i in range(0, out_len, 40):
-                item = raw[i : i + 40]
+            is_64bit = struct.calcsize("P") == 8
+            ifreq_size = 40 if is_64bit else 32
+            for i in range(0, out_len, ifreq_size):
+                item = raw[i : i + ifreq_size]
                 name = item[:16].split(b"\0", 1)[0].decode("ascii", errors="ignore")
                 if not name or name == "lo":
                     continue
@@ -154,8 +158,11 @@ class UDPDiscovery:
         self._running = False
 
         # Debounce cache: device_id -> (timestamp, sender_ip, tcp_port)
-        self._seen_cache: dict[str, Tuple[float, str, int]] = {}
+        self._seen_cache_max_size = 1024
+        self._seen_cache_ttl = 300.0  # 5 minutes expiration
+        self._seen_cache: collections.OrderedDict[str, Tuple[float, str, int]] = collections.OrderedDict()
         self._debounce_window = 2.0
+        self._discovery_semaphore = asyncio.Semaphore(16)
 
     @property
     def is_running(self) -> bool:
@@ -403,7 +410,7 @@ class UDPDiscovery:
         if not isinstance(tcp_port, int) or not (1 <= tcp_port <= 65535):
             tcp_port = 1716
 
-        # 2. Debounce rapid repeat broadcasts
+        # 2. Debounce rapid repeat broadcasts and maintain bounded LRU seen cache
         now = time.time()
         last_entry = self._seen_cache.get(remote_device_id)
         if last_entry:
@@ -414,6 +421,20 @@ class UDPDiscovery:
                 and (last_port == tcp_port)
             ):
                 return
+            self._seen_cache.pop(remote_device_id, None)
+
+        # Prune expired entries
+        while self._seen_cache:
+            oldest_key, (oldest_time, _, _) = next(iter(self._seen_cache.items()))
+            if now - oldest_time > self._seen_cache_ttl:
+                self._seen_cache.pop(oldest_key, None)
+            else:
+                break
+
+        # Cap cache capacity
+        while len(self._seen_cache) >= self._seen_cache_max_size:
+            self._seen_cache.popitem(last=False)
+
         self._seen_cache[remote_device_id] = (now, sender_ip, tcp_port)
 
         raw_version = body.get("protocolVersion", 7)
@@ -448,16 +469,24 @@ class UDPDiscovery:
             tcp_port,
         )
 
-        # Dispatch discovered device asynchronously with strong task tracking
+        # Dispatch discovered device: invoke sync callbacks immediately, throttle async coroutines
         if self.on_device_discovered:
             cb_res = self.on_device_discovered(discovered)
-            if asyncio.iscoroutine(cb_res):
-                task = asyncio.create_task(
-                    cb_res,
-                    name=f"udp_on_device_discovered_{discovered.device_id}",
-                )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+            if inspect.isawaitable(cb_res):
+                async def _throttled_dispatch(coro: Any) -> None:
+                    async with self._discovery_semaphore:
+                        await coro
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    task = loop.create_task(
+                        _throttled_dispatch(cb_res),
+                        name=f"udp_on_device_discovered_{discovered.device_id}",
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                except RuntimeError:
+                    cb_res.close()
 
 
 # Alias for UdpDiscovery

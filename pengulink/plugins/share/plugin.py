@@ -18,7 +18,7 @@ import logging
 import os
 from pathlib import Path
 import time
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple, Union
 
 from pengulink.core.config import Config
 from pengulink.core.events import (
@@ -126,6 +126,8 @@ class SharePlugin(Plugin):
         self.payload_manager = PayloadTransferManager(event_bus=event_bus)
         self._active_transfers: Dict[str, asyncio.Task[Any]] = {}
         self._lock = asyncio.Lock()
+        self._reserved_destinations: Set[Path] = set()
+        self._collision_lock = asyncio.Lock()
 
     @property
     def plugin_id(self) -> str:
@@ -214,19 +216,96 @@ class SharePlugin(Plugin):
 
         dest_dir = resolve_download_dir(config=self.config)
         clean_name = sanitize_filename(raw_filename)
-        final_path = resolve_collision(dest_dir, clean_name)
-        validate_containment(dest_dir, final_path)
+        async with self._collision_lock:
+            final_path = resolve_collision(dest_dir, clean_name, self._reserved_destinations)
+            self._reserved_destinations.add(final_path)
 
-        # Handle zero-byte file
-        if payload_size == 0 or port is None:
-            final_path.touch(mode=0o644, exist_ok=True)
+        try:
+            validate_containment(dest_dir, final_path)
+
+            # Handle zero-byte file
+            if payload_size == 0 or port is None:
+                final_path.touch(mode=0o644, exist_ok=True)
+                try:
+                    os.chmod(final_path, 0o644)
+                except OSError:
+                    pass
+                if self.event_bus:
+                    await self.event_bus.publish(
+                        FileReceivedEvent(device_id=device_id, file_path=final_path, file_size=0, filename=final_path.name)
+                    )
+                    await self.event_bus.publish(
+                        ShareReceivedEvent(
+                            device_id=device_id,
+                            share_type="file",
+                            filename=final_path.name,
+                            file_path=final_path,
+                            file_size=0,
+                        )
+                    )
+                return
+
+            # Resolve peer connection info
+            peer_info = self.peer_resolver(device_id) if self.peer_resolver else None
+            if inspect.isawaitable(peer_info):
+                peer_info = await peer_info
+            if not peer_info:
+                logger.error("Cannot receive file payload: peer info unresolvable for device %s", device_id)
+                return
+            peer_ip, peer_cert_pem = peer_info
+
+            client = PayloadClient(
+                local_cert_pem=self.local_cert_pem or b"",
+                local_key_pem=self.local_key_pem or b"",
+                peer_cert_pem=peer_cert_pem,
+            )
+
+            async def _progress_cb(transferred: int, total: int, pct: float) -> None:
+                if self.event_bus:
+                    await self.event_bus.publish(
+                        FileTransferProgress(
+                            device_id=device_id,
+                            filename=final_path.name,
+                            direction="incoming",
+                            bytes_transferred=transferred,
+                            total_bytes=total,
+                            percentage=pct,
+                        )
+                    )
+
+            staging_writer = AtomicStagingWriter(
+                dest_dir=dest_dir,
+                final_path=final_path,
+                expected_size=payload_size,
+                last_modified=body.get("lastModified"),
+            )
+
+            task = asyncio.create_task(
+                client.download_to_staging(
+                    target_host=peer_ip,
+                    target_port=port,
+                    expected_size=payload_size,
+                    staging_writer=staging_writer,
+                    target_device_id=device_id,
+                    filename=final_path.name,
+                    progress_callback=_progress_cb,
+                )
+            )
+            self.payload_manager.track_task(device_id, task)
+            self._active_transfers[final_path.name] = task
             try:
-                os.chmod(final_path, 0o644)
-            except OSError:
-                pass
+                await task
+            finally:
+                self._active_transfers.pop(final_path.name, None)
+
             if self.event_bus:
                 await self.event_bus.publish(
-                    FileReceivedEvent(device_id=device_id, file_path=final_path, file_size=0, filename=final_path.name)
+                    FileReceivedEvent(
+                        device_id=device_id,
+                        file_path=final_path,
+                        file_size=payload_size,
+                        filename=final_path.name,
+                    )
                 )
                 await self.event_bus.publish(
                     ShareReceivedEvent(
@@ -234,82 +313,12 @@ class SharePlugin(Plugin):
                         share_type="file",
                         filename=final_path.name,
                         file_path=final_path,
-                        file_size=0,
+                        file_size=payload_size,
                     )
                 )
-            return
-
-        # Resolve peer connection info
-        peer_info = self.peer_resolver(device_id) if self.peer_resolver else None
-        if inspect.isawaitable(peer_info):
-            peer_info = await peer_info
-        if not peer_info:
-            logger.error("Cannot receive file payload: peer info unresolvable for device %s", device_id)
-            return
-        peer_ip, peer_cert_pem = peer_info
-
-        client = PayloadClient(
-            local_cert_pem=self.local_cert_pem or b"",
-            local_key_pem=self.local_key_pem or b"",
-            peer_cert_pem=peer_cert_pem,
-        )
-
-        async def _progress_cb(transferred: int, total: int, pct: float) -> None:
-            if self.event_bus:
-                await self.event_bus.publish(
-                    FileTransferProgress(
-                        device_id=device_id,
-                        filename=final_path.name,
-                        direction="incoming",
-                        bytes_transferred=transferred,
-                        total_bytes=total,
-                        percentage=pct,
-                    )
-                )
-
-        staging_writer = AtomicStagingWriter(
-            dest_dir=dest_dir,
-            final_path=final_path,
-            expected_size=payload_size,
-            last_modified=body.get("lastModified"),
-        )
-
-        task = asyncio.create_task(
-            client.download_to_staging(
-                target_host=peer_ip,
-                target_port=port,
-                expected_size=payload_size,
-                staging_writer=staging_writer,
-                target_device_id=device_id,
-                filename=final_path.name,
-                progress_callback=_progress_cb,
-            )
-        )
-        self.payload_manager.track_task(device_id, task)
-        self._active_transfers[final_path.name] = task
-        try:
-            await task
         finally:
-            self._active_transfers.pop(final_path.name, None)
-
-        if self.event_bus:
-            await self.event_bus.publish(
-                FileReceivedEvent(
-                    device_id=device_id,
-                    file_path=final_path,
-                    file_size=payload_size,
-                    filename=final_path.name,
-                )
-            )
-            await self.event_bus.publish(
-                ShareReceivedEvent(
-                    device_id=device_id,
-                    share_type="file",
-                    filename=final_path.name,
-                    file_path=final_path,
-                    file_size=payload_size,
-                )
-            )
+            async with self._collision_lock:
+                self._reserved_destinations.discard(final_path)
 
     async def share_text(
         self,

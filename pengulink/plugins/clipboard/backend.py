@@ -21,7 +21,7 @@ import signal
 import struct
 import sys
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional, Set
 
 from pengulink.core.exceptions import PluginError
 
@@ -352,6 +352,7 @@ class X11ClipboardBackend(ClipboardBackend):
         self._callback: Optional[ClipboardChangeCallback] = None
         self._stopped: bool = False
         self._notify_pending: bool = False
+        self._tasks: Set[asyncio.Task[Any]] = set()
 
     @property
     def _tool(self) -> Optional[str]:
@@ -553,7 +554,9 @@ class X11ClipboardBackend(ClipboardBackend):
             # Coalesce rapid notifications within a single event loop tick
             if not self._notify_pending:
                 self._notify_pending = True
-                asyncio.create_task(self._coalesced_notify())
+                task = asyncio.create_task(self._coalesced_notify())
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
         except Exception as exc:
             logger.error("Error reading X11 event: %s", exc)
 
@@ -577,6 +580,10 @@ class X11ClipboardBackend(ClipboardBackend):
 
     async def stop_watching(self) -> None:
         self._stopped = True
+        for t in list(self._tasks):
+            if not t.done():
+                t.cancel()
+        self._tasks.clear()
         if self._x11_fd is not None:
             try:
                 loop = asyncio.get_running_loop()

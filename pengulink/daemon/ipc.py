@@ -21,6 +21,8 @@ from pengulink.core.exceptions import (
     AlertError,
     AudioBackendError,
     AudioUnavailableError,
+    CommandExecutionError,
+    CommandNotFoundError,
     ConnectionClosedError,
     ConnectionTimeoutError,
     ContactNotFoundError,
@@ -41,11 +43,16 @@ from pengulink.core.exceptions import (
     PenguLinkError,
     RemoteCommandError,
     RemoteCommandNotFoundError,
+    RunCommandError,
     ShareError,
+    StorageCorruptedError,
+    StorageError,
+    StorageWriteError,
     SyncTimeoutError,
     TransferError,
 )
 from pengulink.plugins.clipboard.backend import ClipboardError, ClipboardUnavailableError
+from pengulink.services.audio import AudioError
 
 logger = logging.getLogger("pengulink.daemon.ipc")
 
@@ -75,6 +82,9 @@ SHARE_ERROR = -32011
 CONTACTS_ERROR = -32012
 MPRIS_ERROR = -32013
 REMOTE_COMMANDS_ERROR = -32014
+AUDIO_SYSTEM_VOLUME_ERROR = -32015
+RUN_COMMAND_ERROR = -32016
+
 
 
 
@@ -380,6 +390,14 @@ class PenguLinkIPCServer:
             return self._format_error(req_id if has_id else None, MPRIS_ERROR, str(exc)) if has_id else b""
         except (RemoteCommandError, RemoteCommandNotFoundError) as exc:
             return self._format_error(req_id if has_id else None, REMOTE_COMMANDS_ERROR, str(exc)) if has_id else b""
+        except (RunCommandError, CommandNotFoundError, CommandExecutionError) as exc:
+            return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
+        except (StorageError, StorageCorruptedError, StorageWriteError) as exc:
+            if method.startswith("runcommand_"):
+                return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
+            return self._format_error(req_id if has_id else None, APPLICATION_ERROR, str(exc)) if has_id else b""
+        except AudioError as exc:
+            return self._format_error(req_id if has_id else None, AUDIO_SYSTEM_VOLUME_ERROR, str(exc)) if has_id else b""
 
         except InvalidStateTransitionError as exc:
             return self._format_error(req_id if has_id else None, INVALID_STATE_TRANSITION, str(exc)) if has_id else b""
@@ -393,30 +411,48 @@ class PenguLinkIPCServer:
             msg = str(exc).lower()
             if "method" in msg or "unknown" in msg:
                 return self._format_error(req_id if has_id else None, METHOD_NOT_FOUND, f"Method not found: {exc}") if has_id else b""
+            if method.startswith("runcommand_"):
+                return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
             return self._format_error(req_id if has_id else None, INVALID_PARAMS, f"Invalid parameters: {exc}") if has_id else b""
         except (ValueError, TypeError) as exc:
+            if method.startswith("runcommand_") and ("disabled" in str(exc).lower() or "not found" in str(exc).lower()):
+                return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
             return self._format_error(req_id if has_id else None, INVALID_PARAMS, f"Invalid parameters: {exc}") if has_id else b""
         except ClipboardUnavailableError as exc:
             return self._format_error(req_id if has_id else None, INTERNAL_ERROR, str(exc)) if has_id else b""
         except ClipboardError as exc:
             return self._format_error(req_id if has_id else None, CLIPBOARD_ERROR, str(exc)) if has_id else b""
         except (AlertError, AudioBackendError, AudioUnavailableError) as exc:
+            if method.startswith("systemvolume_"):
+                return self._format_error(req_id if has_id else None, AUDIO_SYSTEM_VOLUME_ERROR, str(exc)) if has_id else b""
             return self._format_error(req_id if has_id else None, ALERT_ERROR, str(exc)) if has_id else b""
         except (ShareError, PathTraversalError, TransferError, PayloadTransferError) as exc:
             return self._format_error(req_id if has_id else None, SHARE_ERROR, str(exc)) if has_id else b""
         except PenguLinkError as exc:
-
             msg = str(exc)
             if "not connected" in msg.lower():
                 code = DEVICE_NOT_CONNECTED
             elif "not found" in msg.lower():
-                code = DEVICE_NOT_FOUND
+                if method.startswith("runcommand_"):
+                    code = RUN_COMMAND_ERROR
+                elif method.startswith("systemvolume_"):
+                    code = AUDIO_SYSTEM_VOLUME_ERROR
+                else:
+                    code = DEVICE_NOT_FOUND
             elif "clipboard" in msg.lower() or "backend" in msg.lower():
                 code = CLIPBOARD_ERROR
+            elif method.startswith("systemvolume_"):
+                code = AUDIO_SYSTEM_VOLUME_ERROR
+            elif method.startswith("runcommand_"):
+                code = RUN_COMMAND_ERROR
             else:
                 code = APPLICATION_ERROR
             return self._format_error(req_id if has_id else None, code, msg) if has_id else b""
         except Exception as exc:
+            if method.startswith("systemvolume_"):
+                return self._format_error(req_id if has_id else None, AUDIO_SYSTEM_VOLUME_ERROR, str(exc)) if has_id else b""
+            if method.startswith("runcommand_"):
+                return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
             if method == "set_clipboard":
                 logger.warning("Error executing IPC method '%s': %s", method, type(exc).__name__)
             else:
@@ -505,7 +541,9 @@ class PenguLinkIPCClient:
                 err = response["error"]
                 err_code = err.get("code")
                 err_msg = err.get("message", "Unknown error")
-                raise IPCError(f"IPC Error [{err_code}]: {err_msg}")
+                exc = IPCError(f"IPC Error [{err_code}]: {err_msg}", context={"code": err_code})
+                setattr(exc, "code", err_code)
+                raise exc
 
             return response.get("result")
         except (asyncio.TimeoutError, TimeoutError) as exc:
@@ -889,6 +927,180 @@ class PenguLinkIPCClient:
     remotecommands_list = list_remote_commands
     remotecommands_run = execute_remote_command
 
+    # =====================================================================
+    # SystemVolume Local and Remote Methods (Milestones 22, 24, 25)
+    # =====================================================================
+
+    async def systemvolume_get_sinks(
+        self,
+        timeout: float = 10.0,
+    ) -> List[Dict[str, Any]]:
+        """List local audio output sinks."""
+        res = await self.call("systemvolume_get_sinks", {}, timeout=timeout)
+        return list(res) if isinstance(res, list) else []
+
+    async def systemvolume_set_volume(
+        self,
+        name: str,
+        volume: int,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Set volume on a local audio sink."""
+        params: Dict[str, Any] = {"name": name, "volume": volume}
+        res = await self.call("systemvolume_set_volume", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def systemvolume_set_muted(
+        self,
+        name: str,
+        muted: bool,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Set mute state on a local audio sink."""
+        params: Dict[str, Any] = {"name": name, "muted": muted}
+        res = await self.call("systemvolume_set_muted", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def systemvolume_set_default(
+        self,
+        name: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Set default local audio sink."""
+        params: Dict[str, Any] = {"name": name}
+        res = await self.call("systemvolume_set_default", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def systemvolume_get_remote_sinks(
+        self,
+        device_id: str,
+        timeout: float = 10.0,
+    ) -> List[Dict[str, Any]]:
+        """List cached audio sinks for a remote device."""
+        params: Dict[str, Any] = {"device_id": device_id}
+        res = await self.call("systemvolume_get_remote_sinks", params, timeout=timeout)
+        return list(res) if isinstance(res, list) else []
+
+    async def systemvolume_set_remote_volume(
+        self,
+        device_id: str,
+        name: str,
+        volume: int,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Set volume on a remote device audio sink."""
+        params: Dict[str, Any] = {"device_id": device_id, "name": name, "volume": volume}
+        res = await self.call("systemvolume_set_remote_volume", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def systemvolume_set_remote_muted(
+        self,
+        device_id: str,
+        name: str,
+        muted: bool,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Set mute state on a remote device audio sink."""
+        params: Dict[str, Any] = {"device_id": device_id, "name": name, "muted": muted}
+        res = await self.call("systemvolume_set_remote_muted", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def systemvolume_set_remote_default(
+        self,
+        device_id: str,
+        name: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Set default audio sink on a remote device."""
+        params: Dict[str, Any] = {"device_id": device_id, "name": name}
+        res = await self.call("systemvolume_set_remote_default", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def systemvolume_request_remote_sinks(
+        self,
+        device_id: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Request remote peer to re-advertise its complete audio sink list."""
+        params: Dict[str, Any] = {"device_id": device_id}
+        res = await self.call("systemvolume_request_remote_sinks", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    # SystemVolume Client Aliases
+    list_remote_audio_sinks = systemvolume_get_remote_sinks
+    set_remote_audio_volume = systemvolume_set_remote_volume
+    set_remote_audio_mute = systemvolume_set_remote_muted
+    request_remote_audio_sinks = systemvolume_request_remote_sinks
+
+    # =====================================================================
+    # RunCommand Local Methods (Milestones 23, 25)
+    # =====================================================================
+
+    async def runcommand_list(
+        self,
+        timeout: float = 10.0,
+    ) -> List[Dict[str, Any]]:
+        """List all configured local commands."""
+        res = await self.call("runcommand_list", {}, timeout=timeout)
+        return list(res) if isinstance(res, list) else []
+
+    async def runcommand_get(
+        self,
+        key: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Retrieve single configured local command by key."""
+        params: Dict[str, Any] = {"key": key}
+        res = await self.call("runcommand_get", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def runcommand_add(
+        self,
+        name: str,
+        command: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Add a locally configured command entry."""
+        params: Dict[str, Any] = {"name": name, "command": command}
+        res = await self.call("runcommand_add", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def runcommand_remove(
+        self,
+        key: str,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Remove a locally configured command entry by key."""
+        params: Dict[str, Any] = {"key": key}
+        res = await self.call("runcommand_remove", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def runcommand_exec(
+        self,
+        key: str,
+        timeout: float = 65.0,
+    ) -> Dict[str, Any]:
+        """Execute a locally configured command by key."""
+        params: Dict[str, Any] = {"key": key}
+        res = await self.call("runcommand_exec", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def runcommand_stop(
+        self,
+        id: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Dict[str, Any]:
+        """Stop running local command process by process id or all processes."""
+        params: Dict[str, Any] = {}
+        if id is not None:
+            params["id"] = id
+        res = await self.call("runcommand_stop", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    # RunCommand Client Aliases
+    list_local_commands = runcommand_list
+    execute_local_command = runcommand_exec
+
 
 # Convenience Alias
 IPCSocketClient = PenguLinkIPCClient
@@ -916,10 +1128,10 @@ __all__ = [
     "CONTACTS_ERROR",
     "MPRIS_ERROR",
     "REMOTE_COMMANDS_ERROR",
+    "AUDIO_SYSTEM_VOLUME_ERROR",
+    "RUN_COMMAND_ERROR",
     "resolve_socket_path",
     "PenguLinkIPCServer",
     "PenguLinkIPCClient",
     "IPCSocketClient",
 ]
-
-

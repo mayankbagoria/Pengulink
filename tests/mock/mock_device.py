@@ -102,7 +102,11 @@ class MockDeviceConfig:
             "kdeconnect.remotecommands.request",
             "kdeconnect.runcommand",
             "kdeconnect.runcommand.request",
+            "kdeconnect.runcommand.output",
             "kdeconnect.remoteforcecommand",
+            # SystemVolume & RemoteSystemVolume Capabilities
+            "kdeconnect.systemvolume",
+            "kdeconnect.systemvolume.request",
         ]
     )
     outgoing_capabilities: list[str] = field(
@@ -135,6 +139,9 @@ class MockDeviceConfig:
             "kdeconnect.runcommand.request",
             "kdeconnect.runcommand.output",
             "kdeconnect.remoteforcecommand",
+            # SystemVolume & RemoteSystemVolume Capabilities
+            "kdeconnect.systemvolume",
+            "kdeconnect.systemvolume.request",
         ]
     )
 
@@ -153,6 +160,9 @@ class MockDeviceConfig:
     auto_commands_reply: bool = True
     auto_command_output: bool = False
     default_command_list_format: str = "dict"
+    # SystemVolume Configuration Flags
+    auto_systemvolume_reply: bool = True
+    auto_systemvolume_broadcast: bool = True
 
 
 @dataclass
@@ -199,6 +209,12 @@ class ChaosConfig:
     commands_corrupt_command_list: bool = False
     commands_malformed_json_string: bool = False
     commands_drop_output: bool = False
+
+    # SystemVolume Fault & Chaos Injection
+    systemvolume_ignore_requests: bool = False
+    systemvolume_delay: float = 0.0
+    systemvolume_drop_sink_list: bool = False
+    systemvolume_corrupt_sink_list: bool = False
 
 
     packet_interceptor: Optional[Callable[[Packet], Optional[Union[Packet, bytes]]]] = None
@@ -277,6 +293,30 @@ class MockKdeConnectDevice:
         }
         self._executed_commands: List[str] = []
         self._command_exec_requests: List[Packet] = []
+        self._command_stop_requests: List[Packet] = []
+        self._received_command_outputs: List[Packet] = []
+
+        # SystemVolume Simulation State
+        self._mock_sinks: Dict[str, Dict[str, Any]] = {
+            "speaker": {
+                "name": "speaker",
+                "description": "Internal Speaker",
+                "muted": False,
+                "volume": 32768,
+                "maxVolume": 65536,
+                "enabled": True,
+            },
+            "headphones": {
+                "name": "headphones",
+                "description": "Wired Headphones",
+                "muted": False,
+                "volume": 49152,
+                "maxVolume": 65536,
+                "enabled": False,
+            },
+        }
+        self._systemvolume_requests: List[Packet] = []
+        self._systemvolume_announcements: List[Packet] = []
 
 
     @property
@@ -964,6 +1004,57 @@ class MockKdeConnectDevice:
                     )
                     code = 0 if cmd_key in self._mock_commands else 1
                     await self.send_command_output(key=cmd_key, output=output_msg, exit_code=code)
+
+            # Case C: Process stop request
+            if body.get("stop"):
+                self._command_stop_requests.append(packet)
+
+        # ------------------------------------------------------------------
+        # 10. RunCommand Output & Announcement Handling
+        # ------------------------------------------------------------------
+        elif packet.type == "kdeconnect.runcommand.output":
+            self._received_command_outputs.append(packet)
+
+        # ------------------------------------------------------------------
+        # 11. SystemVolume Request & Status Handling
+        # ------------------------------------------------------------------
+        elif packet.type == "kdeconnect.systemvolume.request":
+            self._systemvolume_requests.append(packet)
+            body = packet.body or {}
+
+            # Case A: Request sink list
+            if body.get("requestSinks"):
+                if self.config.auto_systemvolume_reply and not self.chaos_config.systemvolume_ignore_requests:
+                    if self.chaos_config.systemvolume_delay > 0:
+                        await asyncio.sleep(self.chaos_config.systemvolume_delay)
+                    if not self.chaos_config.systemvolume_drop_sink_list:
+                        await self.send_sink_list()
+
+            # Case B: Volume / Mute / Enabled adjustment
+            if "name" in body:
+                sink_name = str(body["name"])
+                if sink_name in self._mock_sinks:
+                    sink = self._mock_sinks[sink_name]
+                    if "volume" in body:
+                        raw_vol = int(body["volume"])
+                        max_vol = int(sink.get("maxVolume", 65536))
+                        sink["volume"] = max(0, min(max_vol, raw_vol))
+                        sink["muted"] = False  # KDE Connect upstream un-mutes on volume change
+                    if "muted" in body:
+                        sink["muted"] = bool(body["muted"])
+                    if "enabled" in body:
+                        sink["enabled"] = bool(body["enabled"])
+
+                    if self.config.auto_systemvolume_broadcast:
+                        await self.send_sink_update(
+                            name=sink_name,
+                            volume=sink.get("volume"),
+                            muted=sink.get("muted"),
+                            enabled=sink.get("enabled"),
+                        )
+
+        elif packet.type == "kdeconnect.systemvolume":
+            self._systemvolume_announcements.append(packet)
 
 
     # ------------------------------------------------------------------
@@ -1785,6 +1876,293 @@ class MockKdeConnectDevice:
 
         raise ConnectionTimeoutError(
             f"Timed out waiting for remote command execution (key={key})",
+            timeout_seconds=timeout,
+        )
+
+    async def send_runcommand_request(
+        self,
+        key: Optional[str] = None,
+        request_command_list: bool = False,
+        stop: bool = False,
+    ) -> Packet:
+        """Transmit kdeconnect.runcommand.request packet to trigger execution, query commands, or stop."""
+        body: Dict[str, Any] = {}
+        if key is not None:
+            body["key"] = key
+        elif request_command_list:
+            body["requestCommandList"] = True
+        elif stop:
+            body["stop"] = True
+
+        pkt = Packet(type="kdeconnect.runcommand.request", body=body)
+        await self.send_packet(pkt)
+        return pkt
+
+    def get_command_stop_requests(self) -> List[Packet]:
+        """Return history of received process stop request packets."""
+        return list(self._command_stop_requests)
+
+    def get_received_command_outputs(self, key: Optional[str] = None) -> List[Packet]:
+        """Return history of received kdeconnect.runcommand.output packets."""
+        if key is None:
+            return list(self._received_command_outputs)
+        return [p for p in self._received_command_outputs if p.body.get("key") == key]
+
+    async def wait_for_runcommand_output(
+        self,
+        key: Optional[str] = None,
+        phase: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> Packet:
+        """Wait for an incoming kdeconnect.runcommand.output packet, optionally filtering by key or phase.
+
+        Args:
+            key: Optional command key filter.
+            phase: Optional phase filter: 'commandStarted', 'commandOutput', or 'commandFinished'.
+            timeout: Timeout in seconds.
+        """
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+
+        def _matches(p: Packet) -> bool:
+            if p.type != "kdeconnect.runcommand.output":
+                return False
+            body = p.body or {}
+            if key is not None and body.get("key") != key:
+                return False
+            if phase is not None and not body.get(phase):
+                return False
+            return True
+
+        while loop.time() - start_time < timeout:
+            for p in self._received_command_outputs:
+                if _matches(p):
+                    return p
+            try:
+                pkt = await self.wait_for_packet("kdeconnect.runcommand.output", timeout=min(0.2, timeout))
+                if _matches(pkt):
+                    return pkt
+            except ConnectionTimeoutError:
+                pass
+
+        raise ConnectionTimeoutError(
+            f"Timed out waiting for kdeconnect.runcommand.output (key={key}, phase={phase})",
+            timeout_seconds=timeout,
+        )
+
+    async def wait_for_runcommand_list(self, timeout: float = 5.0) -> Packet:
+        """Wait for an incoming kdeconnect.runcommand packet containing commandList."""
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+
+        while loop.time() - start_time < timeout:
+            for p in self._received_packets:
+                if p.type == "kdeconnect.runcommand" and "commandList" in (p.body or {}):
+                    return p
+            try:
+                pkt = await self.wait_for_packet("kdeconnect.runcommand", timeout=min(0.2, timeout))
+                if "commandList" in (pkt.body or {}):
+                    return pkt
+            except ConnectionTimeoutError:
+                pass
+
+        raise ConnectionTimeoutError(
+            "Timed out waiting for kdeconnect.runcommand with commandList",
+            timeout_seconds=timeout,
+        )
+
+    # ------------------------------------------------------------------
+    # SystemVolume Simulation Helpers (Audio Sinks & Mixer Controls)
+    # ------------------------------------------------------------------
+    def set_mock_sinks(
+        self,
+        sinks: Union[Dict[str, Dict[str, Any]], List[Dict[str, Any]]],
+    ) -> None:
+        """Stage mock audio output sinks on the virtual device."""
+        self._mock_sinks.clear()
+        if isinstance(sinks, list):
+            for s in sinks:
+                name = s.get("name")
+                if name:
+                    self._mock_sinks[str(name)] = {
+                        "name": str(name),
+                        "description": str(s.get("description", name)),
+                        "muted": bool(s.get("muted", False)),
+                        "volume": int(s.get("volume", 32768)),
+                        "maxVolume": int(s.get("maxVolume", 65536)),
+                        "enabled": bool(s.get("enabled", False)),
+                    }
+        elif isinstance(sinks, dict):
+            for name, val in sinks.items():
+                if isinstance(val, dict):
+                    self._mock_sinks[str(name)] = {
+                        "name": str(val.get("name", name)),
+                        "description": str(val.get("description", name)),
+                        "muted": bool(val.get("muted", False)),
+                        "volume": int(val.get("volume", 32768)),
+                        "maxVolume": int(val.get("maxVolume", 65536)),
+                        "enabled": bool(val.get("enabled", False)),
+                    }
+
+    def add_mock_sink(
+        self,
+        name: str,
+        description: str = "",
+        volume: int = 32768,
+        max_volume: int = 65536,
+        muted: bool = False,
+        enabled: bool = False,
+    ) -> None:
+        """Add or update a single staged mock audio sink."""
+        self._mock_sinks[name] = {
+            "name": name,
+            "description": description or name,
+            "muted": muted,
+            "volume": volume,
+            "maxVolume": max_volume,
+            "enabled": enabled,
+        }
+
+    def remove_mock_sink(self, name: str) -> bool:
+        """Remove a staged mock sink by name."""
+        return self._mock_sinks.pop(name, None) is not None
+
+    def clear_mock_sinks(self) -> None:
+        """Clear all staged mock sinks."""
+        self._mock_sinks.clear()
+
+    def get_mock_sinks(self) -> Dict[str, Dict[str, Any]]:
+        """Return a copy of currently staged mock sinks."""
+        return {k: dict(v) for k, v in self._mock_sinks.items()}
+
+    async def send_sink_list(
+        self,
+        sinks: Optional[Union[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]] = None,
+    ) -> Packet:
+        """Transmit kdeconnect.systemvolume packet advertising available audio sinks."""
+        if sinks is None:
+            sink_list = [dict(v) for v in self._mock_sinks.values()]
+        elif isinstance(sinks, list):
+            sink_list = [dict(s) for s in sinks]
+        else:
+            sink_list = [dict(v) for v in sinks.values()]
+
+        if self.chaos_config.systemvolume_corrupt_sink_list:
+            body: Dict[str, Any] = {"sinkList": "corrupted_non_list_value"}
+        else:
+            body = {"sinkList": sink_list}
+
+        pkt = Packet(type="kdeconnect.systemvolume", body=body)
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_sink_update(
+        self,
+        name: str,
+        volume: Optional[int] = None,
+        muted: Optional[bool] = None,
+        enabled: Optional[bool] = None,
+    ) -> Packet:
+        """Transmit incremental single sink mutation update (kdeconnect.systemvolume)."""
+        body: Dict[str, Any] = {"name": name}
+        if volume is not None:
+            body["volume"] = volume
+        if muted is not None:
+            body["muted"] = muted
+        if enabled is not None:
+            body["enabled"] = enabled
+
+        pkt = Packet(type="kdeconnect.systemvolume", body=body)
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_volume_request(self, name: str, volume: int) -> Packet:
+        """Transmit kdeconnect.systemvolume.request packet to set volume on remote sink."""
+        pkt = Packet(
+            type="kdeconnect.systemvolume.request",
+            body={"name": name, "volume": volume},
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_mute_request(self, name: str, muted: bool) -> Packet:
+        """Transmit kdeconnect.systemvolume.request packet to toggle mute on remote sink."""
+        pkt = Packet(
+            type="kdeconnect.systemvolume.request",
+            body={"name": name, "muted": muted},
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_default_sink_request(self, name: str, enabled: bool = True) -> Packet:
+        """Transmit kdeconnect.systemvolume.request packet to set active default sink."""
+        pkt = Packet(
+            type="kdeconnect.systemvolume.request",
+            body={"name": name, "enabled": enabled},
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    async def send_request_sinks(self) -> Packet:
+        """Transmit kdeconnect.systemvolume.request packet requesting complete sink list."""
+        pkt = Packet(
+            type="kdeconnect.systemvolume.request",
+            body={"requestSinks": True},
+        )
+        await self.send_packet(pkt)
+        return pkt
+
+    def get_systemvolume_requests(self, name: Optional[str] = None) -> List[Packet]:
+        """Return history of received kdeconnect.systemvolume.request packets."""
+        if name is None:
+            return list(self._systemvolume_requests)
+        return [p for p in self._systemvolume_requests if p.body.get("name") == name]
+
+    def get_systemvolume_announcements(self) -> List[Packet]:
+        """Return history of received kdeconnect.systemvolume announcement packets."""
+        return list(self._systemvolume_announcements)
+
+    async def wait_for_systemvolume_request(
+        self,
+        name: Optional[str] = None,
+        timeout: float = 5.0,
+    ) -> Packet:
+        """Wait for an incoming kdeconnect.systemvolume.request packet, optionally filtering by sink name."""
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+
+        while loop.time() - start_time < timeout:
+            for p in self._systemvolume_requests:
+                if name is None or p.body.get("name") == name:
+                    return p
+            try:
+                pkt = await self.wait_for_packet("kdeconnect.systemvolume.request", timeout=min(0.2, timeout))
+                if name is None or pkt.body.get("name") == name:
+                    return pkt
+            except ConnectionTimeoutError:
+                pass
+
+        raise ConnectionTimeoutError(
+            f"Timed out waiting for kdeconnect.systemvolume.request (name={name})",
+            timeout_seconds=timeout,
+        )
+
+    async def wait_for_systemvolume_announcement(self, timeout: float = 5.0) -> Packet:
+        """Wait for an incoming kdeconnect.systemvolume packet from peer."""
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+
+        while loop.time() - start_time < timeout:
+            for p in self._systemvolume_announcements:
+                return p
+            try:
+                pkt = await self.wait_for_packet("kdeconnect.systemvolume", timeout=min(0.2, timeout))
+                return pkt
+            except ConnectionTimeoutError:
+                pass
+
+        raise ConnectionTimeoutError(
+            "Timed out waiting for kdeconnect.systemvolume announcement",
             timeout_seconds=timeout,
         )
 

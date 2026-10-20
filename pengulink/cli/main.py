@@ -1911,7 +1911,552 @@ def command_run_cmd(ctx: click.Context, device_id: str, key: str, json_flag: boo
     ctx.invoke(command_exec_cmd, device_id=device_id, key=key, json_flag=json_flag)
 
 
+# =====================================================================
+# Volume Control Commands (Milestones 22, 24, 25)
+# =====================================================================
+
+def parse_volume_value(val: str | int) -> tuple[int, bool]:
+    """Parse volume argument into (integer_volume, is_percent_flag)."""
+    s = str(val).strip()
+    if s.endswith("%"):
+        try:
+            pct = max(0, min(100, int(round(float(s[:-1])))))
+            return pct, True
+        except ValueError:
+            raise click.UsageError(f"Invalid volume percentage: '{val}'")
+    try:
+        iv = int(round(float(s)))
+        if 0 <= iv <= 100:
+            return iv, True
+        return max(0, min(65536, iv)), False
+    except ValueError:
+        raise click.UsageError(f"Invalid volume value: '{val}'. Expected percentage (0-100) or raw (0-65536).")
+
+
+def parse_mute_state(val: Optional[str]) -> bool:
+    """Parse mute state string ('on'/'off'/'yes'/'no'/'true'/'false'/'1'/'0'). Default True if omitted."""
+    if val is None:
+        return True
+    s = str(val).strip().lower()
+    if s in ("on", "true", "1", "yes", "mute"):
+        return True
+    elif s in ("off", "false", "0", "no", "unmute"):
+        return False
+    else:
+        raise click.UsageError(f"Invalid mute state: '{val}'. Expected 'on' or 'off'.")
+
+
+@cli.group(name="volume", help="Inspect and control local and remote audio sinks.")
+def volume_group() -> None:
+    """Audio volume and sink management for local host and remote connected devices."""
+    pass
+
+
+# Local Subgroup
+@volume_group.group(name="local", help="Manage local host audio output sinks.")
+def volume_local_group() -> None:
+    """Inspect and adjust local host sound output sinks."""
+    pass
+
+
+@volume_local_group.command(name="list", help="List available local audio output sinks.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_local_list_cmd(ctx: click.Context, json_flag: bool) -> None:
+    """List available local audio output sinks."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    res = run_ipc_call(ctx, "systemvolume_get_sinks")
+    sinks = res if isinstance(res, list) else []
+
+    if is_json:
+        click.echo(json.dumps(sinks, indent=2))
+        return
+
+    if not sinks:
+        console.print("[yellow]No local audio sinks found.[/]")
+        return
+
+    table = Table(
+        title="Local Audio Sinks",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+    )
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Description", style="bold white")
+    table.add_column("Volume %", justify="right")
+    table.add_column("Muted", justify="center")
+    table.add_column("Default", justify="center")
+
+    for s in sinks:
+        name = escape(str(s.get("name", "")))
+        desc = escape(str(s.get("description", "") or name))
+        vol_pct = s.get("volume_percent", 0)
+        raw_vol = s.get("volume", 0)
+        vol_display = f"{vol_pct}% [dim]({raw_vol})[/]"
+        muted = "[bold red]Yes[/]" if s.get("muted") else "[green]No[/]"
+        is_default = "[bold green]● Default[/]" if s.get("enabled") else "[dim]-[/]"
+        table.add_row(name, desc, vol_display, muted, is_default)
+
+    console.print(table)
+
+
+@volume_local_group.command(name="set", help="Set volume percentage or raw level on a local sink.")
+@click.argument("sink", type=str)
+@click.argument("volume", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_local_set_cmd(ctx: click.Context, sink: str, volume: str, json_flag: bool) -> None:
+    """Set volume level on local audio output sink."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    sink = sink.strip()
+    if not sink:
+        raise click.UsageError("Argument 'SINK' must not be empty.")
+
+    vol_val, is_pct = parse_volume_value(volume)
+    raw_vol = round((vol_val / 100.0) * 65536) if is_pct else vol_val
+    params = {"name": sink, "volume": raw_vol}
+    res = run_ipc_call(ctx, "systemvolume_set_volume", params)
+
+    if is_json:
+        out = {
+            "sink": sink,
+            "volume": raw_vol,
+            "volume_percent": vol_val if is_pct else round((raw_vol / 65536.0) * 100),
+            "success": res.get("success", True),
+        }
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    vol_disp = f"{vol_val}%" if is_pct else str(vol_val)
+    console.print(f"[bold green]✓[/] Volume of sink '[bold]{escape(sink)}[/]' set to {vol_disp}.")
+
+
+@volume_local_group.command(name="mute", help="Set mute state on local audio sink.")
+@click.argument("sink", type=str)
+@click.argument("state", type=str, required=False, default=None)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_local_mute_cmd(ctx: click.Context, sink: str, state: Optional[str], json_flag: bool) -> None:
+    """Set mute state on local audio output sink."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    sink = sink.strip()
+    if not sink:
+        raise click.UsageError("Argument 'SINK' must not be empty.")
+
+    muted = parse_mute_state(state)
+    params = {"name": sink, "muted": muted}
+    res = run_ipc_call(ctx, "systemvolume_set_muted", params)
+
+    if is_json:
+        out = {"sink": sink, "muted": muted, "success": res.get("success", True)}
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    st_str = "[bold red]muted[/]" if muted else "[bold green]unmuted[/]"
+    console.print(f"[bold green]✓[/] Local sink '[bold]{escape(sink)}[/]' is now {st_str}.")
+
+
+@volume_local_group.command(name="default", help="Set default local audio output sink.")
+@click.argument("sink", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_local_default_cmd(ctx: click.Context, sink: str, json_flag: bool) -> None:
+    """Set default local audio output sink."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    sink = sink.strip()
+    if not sink:
+        raise click.UsageError("Argument 'SINK' must not be empty.")
+
+    params = {"name": sink}
+    res = run_ipc_call(ctx, "systemvolume_set_default", params)
+
+    if is_json:
+        out = {"sink": sink, "default": True, "success": res.get("success", True)}
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    console.print(f"[bold green]✓[/] Default local sink set to '[bold]{escape(sink)}[/]'.")
+
+
+# Convenience Top-Level Shortcuts on volume
+@volume_group.command(name="list", help="Shortcut: List available local audio sinks.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_top_list_cmd(ctx: click.Context, json_flag: bool) -> None:
+    """Shortcut: List available local audio output sinks."""
+    ctx.invoke(volume_local_list_cmd, json_flag=json_flag)
+
+
+@volume_group.command(name="set", help="Shortcut: Set volume on local sink.")
+@click.argument("sink", type=str)
+@click.argument("volume", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_top_set_cmd(ctx: click.Context, sink: str, volume: str, json_flag: bool) -> None:
+    """Shortcut: Set volume level on local audio output sink."""
+    ctx.invoke(volume_local_set_cmd, sink=sink, volume=volume, json_flag=json_flag)
+
+
+@volume_group.command(name="mute", help="Shortcut: Set mute state on local sink.")
+@click.argument("sink", type=str)
+@click.argument("state", type=str, required=False, default=None)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_top_mute_cmd(ctx: click.Context, sink: str, state: Optional[str], json_flag: bool) -> None:
+    """Shortcut: Set mute state on local audio output sink."""
+    ctx.invoke(volume_local_mute_cmd, sink=sink, state=state, json_flag=json_flag)
+
+
+# Remote Subgroup with Flexible Device ID Handling
+class RemoteVolumeGroup(click.Group):
+    """Click group for remote volume commands allowing syntax:
+    'pengulink volume remote <device_id> <subcommand>' OR
+    'pengulink volume remote <subcommand> <device_id>'
+    """
+
+    def parse_args(self, ctx: click.Context, args: list) -> list:
+        if args and args[0] not in self.commands and args[0] not in ("--help", "-h"):
+            device_id = args.pop(0)
+            ctx.ensure_object(dict)["remote_device_id"] = device_id
+            if not args or (args and args[0] not in self.commands and args[0] not in ("--help", "-h")):
+                args = ["list"] + list(args)
+        return super().parse_args(ctx, args)
+
+
+@volume_group.group(
+    name="remote",
+    cls=RemoteVolumeGroup,
+    help="Inspect and control audio sinks on remote connected devices.",
+)
+def volume_remote_group() -> None:
+    """Inspect and adjust audio output sinks on remote paired devices."""
+    pass
+
+
+@volume_remote_group.command(name="list", help="List audio sinks on remote device.")
+@click.argument("device_id_arg", type=str, required=False, default=None)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_remote_list_cmd(ctx: click.Context, device_id_arg: Optional[str], json_flag: bool) -> None:
+    """List audio sinks reported by remote device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = (device_id_arg or (ctx.obj.get("remote_device_id") if ctx.obj else None) or "").strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    params = {"device_id": device_id}
+    res = run_ipc_call(ctx, "systemvolume_get_remote_sinks", params)
+    sinks = res if isinstance(res, list) else []
+
+    if is_json:
+        click.echo(json.dumps(sinks, indent=2))
+        return
+
+    if not sinks:
+        console.print(f"[yellow]No remote audio sinks cached for device '[bold]{escape(device_id)}[/]'.[/]")
+        return
+
+    table = Table(
+        title=f"Remote Audio Sinks — {escape(device_id)}",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+    )
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Description", style="bold white")
+    table.add_column("Volume %", justify="right")
+    table.add_column("Muted", justify="center")
+    table.add_column("Default", justify="center")
+
+    for s in sinks:
+        name = escape(str(s.get("name", "")))
+        desc = escape(str(s.get("description", "") or name))
+        vol_pct = s.get("volume_percent", 0)
+        raw_vol = s.get("volume", 0)
+        vol_display = f"{vol_pct}% [dim]({raw_vol})[/]"
+        muted = "[bold red]Yes[/]" if s.get("muted") else "[green]No[/]"
+        is_default = "[bold green]● Default[/]" if s.get("enabled") else "[dim]-[/]"
+        table.add_row(name, desc, vol_display, muted, is_default)
+
+    console.print(table)
+
+
+@volume_remote_group.command(name="set", help="Set volume on remote device audio sink.")
+@click.argument("arg1", type=str)
+@click.argument("arg2", type=str)
+@click.argument("arg3", type=str, required=False, default=None)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_remote_set_cmd(
+    ctx: click.Context, arg1: str, arg2: str, arg3: Optional[str], json_flag: bool
+) -> None:
+    """Set volume level on remote device audio sink."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    if arg3 is not None:
+        device_id, sink, volume_str = arg1, arg2, arg3
+    else:
+        device_id = (ctx.obj.get("remote_device_id") if ctx.obj else None) or ""
+        sink, volume_str = arg1, arg2
+
+    device_id = device_id.strip()
+    sink = sink.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+    if not sink:
+        raise click.UsageError("Argument 'SINK' must not be empty.")
+
+    vol_val, is_pct = parse_volume_value(volume_str)
+    raw_vol = round((vol_val / 100.0) * 65536) if is_pct else vol_val
+    params = {"device_id": device_id, "name": sink, "volume": raw_vol}
+    res = run_ipc_call(ctx, "systemvolume_set_remote_volume", params)
+
+    if is_json:
+        out = {
+            "device_id": device_id,
+            "sink": sink,
+            "volume": raw_vol,
+            "volume_percent": vol_val if is_pct else round((raw_vol / 65536.0) * 100),
+            "success": res.get("success", True),
+        }
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    vol_disp = f"{vol_val}%" if is_pct else str(raw_vol)
+    console.print(f"[bold green]✓[/] Remote sink '[bold]{escape(sink)}[/]' volume set to {vol_disp} on device '[bold]{escape(device_id)}[/]'.")
+
+
+@volume_remote_group.command(name="mute", help="Set mute state on remote device audio sink.")
+@click.argument("arg1", type=str)
+@click.argument("arg2", type=str, required=False, default=None)
+@click.argument("arg3", type=str, required=False, default=None)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_remote_mute_cmd(
+    ctx: click.Context, arg1: str, arg2: Optional[str], arg3: Optional[str], json_flag: bool
+) -> None:
+    """Set mute state on remote device audio sink."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    saved_did = (ctx.obj.get("remote_device_id") if ctx.obj else None) or ""
+    if arg3 is not None:
+        device_id, sink, state_str = arg1, arg2, arg3
+    elif saved_did:
+        device_id = saved_did
+        sink = arg1
+        state_str = arg2
+    else:
+        device_id = arg1
+        sink = arg2 or ""
+        state_str = None
+
+    device_id = device_id.strip()
+    sink = (sink or "").strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+    if not sink:
+        raise click.UsageError("Argument 'SINK' must not be empty.")
+
+    muted = parse_mute_state(state_str)
+    params = {"device_id": device_id, "name": sink, "muted": muted}
+    res = run_ipc_call(ctx, "systemvolume_set_remote_muted", params)
+
+    if is_json:
+        out = {"device_id": device_id, "sink": sink, "muted": muted, "success": res.get("success", True)}
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    st_str = "[bold red]muted[/]" if muted else "[bold green]unmuted[/]"
+    console.print(f"[bold green]✓[/] Remote sink '[bold]{escape(sink)}[/]' is now {st_str} on device '[bold]{escape(device_id)}[/]'.")
+
+
+@volume_remote_group.command(name="default", help="Set default audio sink on remote device.")
+@click.argument("arg1", type=str)
+@click.argument("arg2", type=str, required=False, default=None)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_remote_default_cmd(ctx: click.Context, arg1: str, arg2: Optional[str], json_flag: bool) -> None:
+    """Set default audio output sink on remote device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    if arg2 is not None:
+        device_id, sink = arg1, arg2
+    else:
+        device_id = (ctx.obj.get("remote_device_id") if ctx.obj else None) or ""
+        sink = arg1
+
+    device_id = device_id.strip()
+    sink = sink.strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+    if not sink:
+        raise click.UsageError("Argument 'SINK' must not be empty.")
+
+    params = {"device_id": device_id, "name": sink}
+    res = run_ipc_call(ctx, "systemvolume_set_remote_default", params)
+
+    if is_json:
+        out = {"device_id": device_id, "sink": sink, "default": True, "success": res.get("success", True)}
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    console.print(f"[bold green]✓[/] Default remote sink set to '[bold]{escape(sink)}[/]' on device '[bold]{escape(device_id)}[/]'.")
+
+
+@volume_remote_group.command(name="refresh", help="Request fresh audio sink list from remote device.")
+@click.argument("device_id_arg", type=str, required=False, default=None)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def volume_remote_refresh_cmd(ctx: click.Context, device_id_arg: Optional[str], json_flag: bool) -> None:
+    """Request remote peer to re-advertise its complete audio sink list."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = (device_id_arg or (ctx.obj.get("remote_device_id") if ctx.obj else None) or "").strip()
+    if not device_id:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    params = {"device_id": device_id}
+    res = run_ipc_call(ctx, "systemvolume_request_remote_sinks", params)
+
+    if is_json:
+        out = {"device_id": device_id, "success": res.get("success", True), "message": "Remote sink list requested"}
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    console.print(f"[bold green]✓[/] Requested audio sink list update from remote device '[bold]{escape(device_id)}[/]'.")
+
+
+# =====================================================================
+# RunCommand Management Commands (Milestones 23, 25)
+# =====================================================================
+
+@cli.group(name="runcommand", help="Manage and trigger locally configured host commands.")
+def runcommand_group() -> None:
+    """Configure and execute local commands exposed to paired KDE Connect peers."""
+    pass
+
+
+@runcommand_group.command(name="list", help="List all locally configured commands.")
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def runcommand_list_cmd(ctx: click.Context, json_flag: bool) -> None:
+    """List locally configured commands."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    res = run_ipc_call(ctx, "runcommand_list")
+    commands = res if isinstance(res, list) else []
+
+    if is_json:
+        click.echo(json.dumps(commands, indent=2))
+        return
+
+    if not commands:
+        console.print("[yellow]No local commands configured.[/]")
+        return
+
+    table = Table(
+        title="Local Commands",
+        box=box.ROUNDED,
+        header_style="bold green",
+    )
+    table.add_column("Key", style="cyan", no_wrap=True)
+    table.add_column("Name", style="bold white")
+    table.add_column("Command", style="dim")
+    table.add_column("Enabled", justify="center")
+
+    for cmd in commands:
+        k = escape(str(cmd.get("key", "")))
+        n = escape(str(cmd.get("name", "")))
+        c = escape(str(cmd.get("command", "") or ""))
+        en = "[bold green]Yes[/]" if cmd.get("enabled", True) else "[red]No[/]"
+        table.add_row(k, n, c, en)
+
+    console.print(table)
+
+
+@runcommand_group.command(name="add", help="Add a locally configured command entry.")
+@click.argument("name", type=str)
+@click.argument("command", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def runcommand_add_cmd(ctx: click.Context, name: str, command: str, json_flag: bool) -> None:
+    """Add a new command to local command store."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    name = name.strip()
+    command = command.strip()
+    if not name:
+        raise click.UsageError("Argument 'NAME' must not be empty.")
+    if not command:
+        raise click.UsageError("Argument 'COMMAND' must not be empty.")
+
+    params = {"name": name, "command": command}
+    res = run_ipc_call(ctx, "runcommand_add", params)
+
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    key = res.get("key", "")
+    console.print(f"[bold green]✓[/] Added command '[bold]{escape(name)}[/]' with key '[bold cyan]{escape(key)}[/]'.")
+
+
+@runcommand_group.command(name="remove", help="Remove a locally configured command entry by key.")
+@click.argument("key", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def runcommand_remove_cmd(ctx: click.Context, key: str, json_flag: bool) -> None:
+    """Remove a command from local command store by key."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    key = key.strip()
+    if not key:
+        raise click.UsageError("Argument 'KEY' must not be empty.")
+
+    params = {"key": key}
+    res = run_ipc_call(ctx, "runcommand_remove", params)
+
+    if is_json:
+        out = {"key": key, "success": res.get("success", False)}
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    if res.get("success"):
+        console.print(f"[bold green]✓[/] Removed command '[bold cyan]{escape(key)}[/]'.")
+    else:
+        console.print(f"[bold red]✕[/] Command '[bold cyan]{escape(key)}[/]' not found.")
+
+
+@runcommand_group.command(name="run", help="Execute a locally configured command by key.")
+@click.argument("key", type=str)
+@click.option("--json", "json_flag", is_flag=True, default=False, help="Output machine-readable JSON.")
+@click.pass_context
+def runcommand_run_cmd(ctx: click.Context, key: str, json_flag: bool) -> None:
+    """Execute a configured local command and print output."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    key = key.strip()
+    if not key:
+        raise click.UsageError("Argument 'KEY' must not be empty.")
+
+    params = {"key": key}
+    res = run_ipc_call(ctx, "runcommand_exec", params)
+
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    success = bool(res.get("success"))
+    code = res.get("exit_code", 0)
+    stdout_lines = res.get("stdout", [])
+    stderr_lines = res.get("stderr", [])
+
+    if success:
+        console.print(f"[bold green]✓ Command succeeded (exit code {code})[/]")
+    else:
+        console.print(f"[bold red]✕ Command failed (exit code {code})[/]")
+
+    if stdout_lines:
+        console.print("[bold]Standard Output:[/]")
+        for line in stdout_lines:
+            console.print(f"  {escape(line.rstrip())}")
+
+    if stderr_lines:
+        console.print("[bold red]Standard Error:[/]")
+        for line in stderr_lines:
+            console.print(f"  [red]{escape(line.rstrip())}[/]")
+
+
 if __name__ == "__main__":
     cli()
-
-

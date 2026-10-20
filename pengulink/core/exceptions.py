@@ -475,8 +475,25 @@ class RemoteCommandNotFoundError(RemoteCommandError):
     """Raised when a specified remote command key is not found on the device."""
 
 
+# =====================================================================
+# Run Command Host Exceptions (Milestone 23 & 25)
+# =====================================================================
+
+class RunCommandError(PluginError):
+    """Base exception for RunCommand plugin and local execution errors."""
+
+
+class CommandNotFoundError(RunCommandError, KeyError):
+    """Raised when a local command key is not found in the CommandStore."""
+
+
+class CommandExecutionError(RunCommandError):
+    """Raised when execution of a local command fails."""
+
+
 __all__ = [
     "PenguLinkError",
+
     "ConfigError",
     "ConfigValidationError",
     "ConfigNotFoundError",
@@ -551,6 +568,7 @@ __all__ = [
     "MprisPayloadError",
     "RemoteCommandError",
     "RemoteCommandNotFoundError",
+    "RunCommandError",
+    "CommandNotFoundError",
+    "CommandExecutionError",
 ]
-
-

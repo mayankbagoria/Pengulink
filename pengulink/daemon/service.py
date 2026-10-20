@@ -10,6 +10,7 @@ import asyncio
 import collections
 import datetime
 import hashlib
+import inspect
 import logging
 import signal
 import threading
@@ -87,16 +88,36 @@ from pengulink.plugins.mpris import (
     detect_mpris_adapter,
 )
 from pengulink.plugins.remotecommands import RemoteCommandsPlugin
+from pengulink.plugins.remotesystemvolume import RemoteSystemVolumePlugin
+from pengulink.plugins.runcommand import RunCommandPlugin
+from pengulink.plugins.systemvolume import SystemVolumePlugin
 from pengulink.services.alert import AlertService
+from pengulink.services.audio import (
+    AudioError,
+    AudioSink,
+    AudioSinkBackend,
+    LocalAudioService,
+    detect_audio_backend,
+)
+from pengulink.services.command import (
+    CommandEntry,
+    CommandStore,
+    ExecutionResult,
+    LocalCommandService,
+)
 from pengulink.storage.base import DeviceStore
 from pengulink.storage.json_store import JsonStorageBackend
 from pengulink.core.exceptions import (
     ActionUnsupportedError,
+    CommandExecutionError,
+    CommandNotFoundError,
     MprisError,
     MprisPlayerNotFoundError,
     RemoteCommandError,
     RemoteCommandNotFoundError,
+    RunCommandError,
 )
+
 
 
 
@@ -235,8 +256,13 @@ class PenguLinkDaemon:
         clipboard_backend: Optional[ClipboardBackend] = None,
         mpris_adapter: Optional[MprisHostAdapter] = None,
         config_dir: Optional[Union[Path, str]] = None,
+        audio_service: Optional[LocalAudioService] = None,
+        audio_backend: Optional[AudioSinkBackend] = None,
+        command_store: Optional[CommandStore] = None,
+        command_service: Optional[LocalCommandService] = None,
         **kwargs: Any,
     ) -> None:
+
         if config is None:
             overrides: Dict[str, Any] = {}
             if config_dir is not None:
@@ -333,9 +359,52 @@ class PenguLinkDaemon:
         )
         self.plugin_registry.register(self.remote_commands_plugin)
 
+        # SystemVolume Plugin & Audio Service (Milestones 22 & 25)
+        if audio_service is not None:
+            self.audio_service = audio_service
+        elif audio_backend is not None:
+            self.audio_service = LocalAudioService(backend=audio_backend, event_bus=self.event_bus)
+        elif "audio_service" in kwargs:
+            self.audio_service = kwargs["audio_service"]
+        elif "audio_backend" in kwargs:
+            self.audio_service = LocalAudioService(backend=kwargs["audio_backend"], event_bus=self.event_bus)
+        else:
+            self.audio_service = LocalAudioService(backend=None, event_bus=self.event_bus)
+
+        self.system_volume_plugin = SystemVolumePlugin(
+            event_bus=self.event_bus,
+            audio_service=self.audio_service,
+            packet_sender=self._send_system_volume_packet,
+        )
+        self.plugin_registry.register(self.system_volume_plugin)
+
+        # RunCommand Plugin & Command Service (Milestones 23 & 25)
+        self.command_store = command_store or kwargs.get("command_store") or CommandStore()
+        self.command_service = command_service or kwargs.get("command_service") or LocalCommandService(
+            command_store=self.command_store,
+            event_bus=self.event_bus,
+        )
+        self.run_command_plugin = RunCommandPlugin(
+            event_bus=self.event_bus,
+            command_store=self.command_store,
+            command_service=self.command_service,
+            packet_sender=self._send_run_command_packet,
+            is_paired_checker=self.is_device_paired,
+        )
+        self.plugin_registry.register(self.run_command_plugin)
+
+        # RemoteSystemVolume Plugin (Milestones 24 & 25)
+        self.remote_system_volume_plugin = RemoteSystemVolumePlugin(
+            event_bus=self.event_bus,
+            packet_sender=self._send_remote_system_volume_packet,
+            is_paired_checker=self.is_device_paired,
+        )
+        self.plugin_registry.register(self.remote_system_volume_plugin)
+
         if hasattr(self.config, "device"):
             self.config.device.incoming_capabilities = self.plugin_registry.get_all_incoming_capabilities()
             self.config.device.outgoing_capabilities = self.plugin_registry.get_all_outgoing_capabilities()
+
 
 
 
@@ -972,6 +1041,12 @@ class PenguLinkDaemon:
                 self.mpris_remote.on_device_unpaired(remote_id)
             if hasattr(self, "remote_commands_plugin"):
                 self.remote_commands_plugin.on_device_unpaired(remote_id)
+            if hasattr(self, "remote_system_volume_plugin"):
+                self.remote_system_volume_plugin.evict_device(remote_id)
+            if hasattr(self, "run_command_plugin"):
+                res = self.run_command_plugin.on_device_unpaired(remote_id)
+                if inspect.isawaitable(res):
+                    await res
             self._pairing_sessions.pop(remote_id, None)
             self._unpaired_peer_certs.pop(remote_id, None)
             await self._transition_device(remote_id, DeviceState.DISCONNECTED, reason="Peer revoked or rejected pairing")
@@ -1039,6 +1114,13 @@ class PenguLinkDaemon:
             await self._transition_device(remote_id, DeviceState.PAIRED, reason="Pairing confirmed by peer")
             await self._transition_device(remote_id, DeviceState.CONNECTED, reason="Pairing negotiation complete")
             await self.event_bus.publish(DevicePaired(device_id=remote_id, device_name=name))
+            await self.event_bus.publish(
+                DeviceConnected(
+                    device_id=remote_id,
+                    host=getattr(conn, "peer_ip", "127.0.0.1") if conn else "127.0.0.1",
+                    port=getattr(conn, "peer_port", 0) if conn else 0,
+                )
+            )
             fut.set_result(True)
         else:
             # Inbound pairing request from peer
@@ -1095,6 +1177,13 @@ class PenguLinkDaemon:
         await self._transition_device(device_id, DeviceState.PAIRED, reason="Inbound pairing accepted by user")
         await self._transition_device(device_id, DeviceState.CONNECTED, reason="Pairing negotiation complete")
         await self.event_bus.publish(DevicePaired(device_id=device_id, device_name=name))
+        await self.event_bus.publish(
+            DeviceConnected(
+                device_id=device_id,
+                host=getattr(conn, "peer_ip", "127.0.0.1") if conn else "127.0.0.1",
+                port=getattr(conn, "peer_port", 0) if conn else 0,
+            )
+        )
 
         return {
             "device_id": device_id,
@@ -1283,6 +1372,12 @@ class PenguLinkDaemon:
             self.mpris_remote.on_device_unpaired(device_id)
         if hasattr(self, "remote_commands_plugin"):
             self.remote_commands_plugin.on_device_unpaired(device_id)
+        if hasattr(self, "remote_system_volume_plugin"):
+            self.remote_system_volume_plugin.evict_device(device_id)
+        if hasattr(self, "run_command_plugin"):
+            res = self.run_command_plugin.on_device_unpaired(device_id)
+            if inspect.isawaitable(res):
+                await res
         self._unpaired_peer_certs.pop(device_id, None)
         await self._transition_device(device_id, DeviceState.DISCONNECTED, reason="Device explicitly unpaired")
         await self.event_bus.publish(DeviceUnpaired(device_id=device_id))
@@ -1981,8 +2076,208 @@ class PenguLinkDaemon:
         }
 
     # =====================================================================
+    # SystemVolume Feature Actions (Milestones 22, 24, 25)
+    # =====================================================================
+
+    def _send_system_volume_packet(self, arg1: Any, arg2: Optional[Any] = None) -> None:
+        """Transmit SystemVolume packet over active TCP connection."""
+        if isinstance(arg1, Packet):
+            packet = arg1
+            device_id = arg2
+        else:
+            device_id = arg1
+            packet = arg2
+        if not device_id or not packet:
+            return
+        self.send_packet(device_id, packet)
+
+    def _send_remote_system_volume_packet(self, arg1: Any, arg2: Optional[Any] = None) -> None:
+        """Transmit RemoteSystemVolume packet over active TCP connection."""
+        if isinstance(arg1, Packet):
+            packet = arg1
+            device_id = arg2
+        else:
+            device_id = arg1
+            packet = arg2
+        if not device_id or not packet:
+            return
+        self.send_packet(device_id, packet)
+
+    async def systemvolume_get_sinks(self) -> List[Dict[str, Any]]:
+        """List local audio output sinks."""
+        sinks = await self.audio_service.list_sinks()
+        return [s.to_dict() for s in sinks]
+
+    async def systemvolume_set_volume(
+        self, name: str, volume: int, is_percent: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        """Set volume on a local audio sink."""
+        if not name or not isinstance(name, str):
+            raise ValueError("Parameter 'name' is required and must be a string")
+        pct_flag = is_percent if is_percent is not None else (0 <= volume <= 100)
+        success = await self.system_volume_plugin.set_volume(
+            name=name, volume=int(volume), is_percent=pct_flag
+        )
+        return {"success": bool(success)}
+
+    async def systemvolume_set_muted(self, name: str, muted: bool) -> Dict[str, Any]:
+        """Set mute state on a local audio sink."""
+        if not name or not isinstance(name, str):
+            raise ValueError("Parameter 'name' is required and must be a string")
+        success = await self.system_volume_plugin.set_muted(name=name, muted=bool(muted))
+        return {"success": bool(success)}
+
+    async def systemvolume_set_default(self, name: str) -> Dict[str, Any]:
+        """Set default local audio sink."""
+        if not name or not isinstance(name, str):
+            raise ValueError("Parameter 'name' is required and must be a string")
+        success = await self.system_volume_plugin.set_default(name=name)
+        return {"success": bool(success)}
+
+    async def systemvolume_get_remote_sinks(self, device_id: str) -> List[Dict[str, Any]]:
+        """List cached remote audio sinks for a device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        sinks = self.remote_system_volume_plugin.get_sinks(device_id)
+        return [s.to_dict() for s in sinks]
+
+    async def systemvolume_set_remote_volume(
+        self, device_id: str, name: str, volume: int
+    ) -> Dict[str, Any]:
+        """Set volume on a remote device audio sink."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not name or not isinstance(name, str):
+            raise ValueError("Parameter 'name' is required and must be a string")
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+        await self.remote_system_volume_plugin.set_remote_volume(
+            device_id=device_id, name=name, volume=int(volume)
+        )
+        return {"success": True}
+
+    async def systemvolume_set_remote_muted(
+        self, device_id: str, name: str, muted: bool
+    ) -> Dict[str, Any]:
+        """Set mute state on a remote device audio sink."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not name or not isinstance(name, str):
+            raise ValueError("Parameter 'name' is required and must be a string")
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+        await self.remote_system_volume_plugin.set_remote_muted(
+            device_id=device_id, name=name, muted=bool(muted)
+        )
+        return {"success": True}
+
+    async def systemvolume_set_remote_default(
+        self, device_id: str, name: str
+    ) -> Dict[str, Any]:
+        """Set default audio sink on a remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not name or not isinstance(name, str):
+            raise ValueError("Parameter 'name' is required and must be a string")
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+        await self.remote_system_volume_plugin.set_remote_default(
+            device_id=device_id, name=name
+        )
+        return {"success": True}
+
+    async def systemvolume_request_remote_sinks(self, device_id: str) -> Dict[str, Any]:
+        """Request remote peer to re-advertise its complete audio sink list."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a string")
+        if not self.is_device_connected(device_id):
+            raise ConnectionClosedError(f"Device '{device_id}' is not connected")
+        await self.remote_system_volume_plugin.request_remote_sinks(device_id=device_id)
+        return {"success": True}
+
+    # =====================================================================
+    # RunCommand Feature Actions (Milestones 23, 25)
+    # =====================================================================
+
+    def _send_run_command_packet(self, arg1: Any, arg2: Optional[Any] = None) -> None:
+        """Transmit RunCommand packet over active TCP connection."""
+        if isinstance(arg1, Packet):
+            packet = arg1
+            device_id = arg2
+        else:
+            device_id = arg1
+            packet = arg2
+        if not device_id or not packet:
+            return
+        self.send_packet(device_id, packet)
+
+    async def runcommand_list(self) -> List[Dict[str, Any]]:
+        """List configured local commands."""
+        cmds = self.command_store.load_commands()
+        return [c.to_dict() for c in cmds.values()]
+
+    async def runcommand_get(self, key: str) -> Dict[str, Any]:
+        """Retrieve configured local command by key."""
+        if not key or not isinstance(key, str):
+            raise ValueError("Parameter 'key' is required and must be a string")
+        cmd = self.command_store.get_command(key)
+        if cmd is None:
+            raise KeyError(f"Command '{key}' not found in store")
+        return cmd.to_dict()
+
+    async def runcommand_add(self, name: str, command: str) -> Dict[str, Any]:
+        """Add a local command entry."""
+        if not name or not isinstance(name, str):
+            raise ValueError("Parameter 'name' is required and must be a string")
+        if not command or not isinstance(command, str):
+            raise ValueError("Parameter 'command' is required and must be a string")
+        entry = self.command_store.add_command(name=name, command=command)
+        if hasattr(self, "run_command_plugin"):
+            try:
+                await self.run_command_plugin.broadcast_command_list()
+            except Exception:
+                pass
+        return entry.to_dict()
+
+    async def runcommand_remove(self, key: str) -> Dict[str, Any]:
+        """Remove a local command entry by key."""
+        if not key or not isinstance(key, str):
+            raise ValueError("Parameter 'key' is required and must be a string")
+        removed = self.command_store.remove_command(key)
+        if removed and hasattr(self, "run_command_plugin"):
+            try:
+                await self.run_command_plugin.broadcast_command_list()
+            except Exception:
+                pass
+        return {"success": bool(removed)}
+
+    async def runcommand_exec(self, key: str) -> Dict[str, Any]:
+        """Execute a local command by key."""
+        if not key or not isinstance(key, str):
+            raise ValueError("Parameter 'key' is required and must be a string")
+        res = await self.command_service.execute_command(key)
+        return {
+            "success": res.success,
+            "id": res.process_id,
+            "key": res.key,
+            "exit_code": res.exit_code,
+            "output": "".join(res.stdout),
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+        }
+
+    async def runcommand_stop(self, id: Optional[str] = None) -> Dict[str, Any]:
+        """Stop local command execution by process id or all processes."""
+        if id:
+            stopped = await self.command_service.stop_process(id)
+            return {"success": bool(stopped)}
+        await self.command_service.stop_all()
+        return {"success": True}
+
+    # =====================================================================
     # JSON-RPC 2.0 Method Dispatcher
     # =====================================================================
+
 
 
 
@@ -2439,7 +2734,120 @@ class PenguLinkDaemon:
                 raise ValueError("Parameter 'key' is required and must be a string")
             return await self.execute_remote_command(did, key)
 
+        # =================================================================
+        # SystemVolume Local and Remote Routes (Milestone 25)
+        # =================================================================
+        elif method == "systemvolume_get_sinks":
+            return await self.systemvolume_get_sinks()
+
+        elif method == "systemvolume_set_volume":
+            if "name" not in params:
+                raise ValueError("Parameter 'name' is required")
+            if "volume" not in params:
+                raise ValueError("Parameter 'volume' is required")
+            name = str(params["name"])
+            volume = int(params["volume"])
+            return await self.systemvolume_set_volume(name=name, volume=volume)
+
+        elif method == "systemvolume_set_muted":
+            if "name" not in params:
+                raise ValueError("Parameter 'name' is required")
+            if "muted" not in params:
+                raise ValueError("Parameter 'muted' is required")
+            name = str(params["name"])
+            muted = bool(params["muted"])
+            return await self.systemvolume_set_muted(name=name, muted=muted)
+
+        elif method == "systemvolume_set_default":
+            if "name" not in params:
+                raise ValueError("Parameter 'name' is required")
+            name = str(params["name"])
+            return await self.systemvolume_set_default(name=name)
+
+        elif method in ("systemvolume_get_remote_sinks", "list_remote_audio_sinks"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            return await self.systemvolume_get_remote_sinks(did)
+
+        elif method in ("systemvolume_set_remote_volume", "set_remote_audio_volume"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            if "name" not in params:
+                raise ValueError("Parameter 'name' is required")
+            if "volume" not in params:
+                raise ValueError("Parameter 'volume' is required")
+            name = str(params["name"])
+            volume = int(params["volume"])
+            return await self.systemvolume_set_remote_volume(did, name, volume)
+
+        elif method in ("systemvolume_set_remote_muted", "set_remote_audio_mute"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            if "name" not in params:
+                raise ValueError("Parameter 'name' is required")
+            if "muted" not in params:
+                raise ValueError("Parameter 'muted' is required")
+            name = str(params["name"])
+            muted = bool(params["muted"])
+            return await self.systemvolume_set_remote_muted(did, name, muted)
+
+        elif method == "systemvolume_set_remote_default":
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            if "name" not in params:
+                raise ValueError("Parameter 'name' is required")
+            name = str(params["name"])
+            return await self.systemvolume_set_remote_default(did, name)
+
+        elif method in ("systemvolume_request_remote_sinks", "request_remote_audio_sinks"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str):
+                raise ValueError("Parameter 'device_id' is required and must be a string")
+            return await self.systemvolume_request_remote_sinks(did)
+
+        # =================================================================
+        # RunCommand Local Routes (Milestone 25)
+        # =================================================================
+        elif method in ("runcommand_list", "list_local_commands"):
+            return await self.runcommand_list()
+
+        elif method == "runcommand_get":
+            key = params.get("key")
+            if not key or not isinstance(key, str):
+                raise ValueError("Parameter 'key' is required and must be a string")
+            return await self.runcommand_get(key)
+
+        elif method == "runcommand_add":
+            name = params.get("name")
+            if not name or not isinstance(name, str):
+                raise ValueError("Parameter 'name' is required and must be a string")
+            command = params.get("command")
+            if not command or not isinstance(command, str):
+                raise ValueError("Parameter 'command' is required and must be a string")
+            return await self.runcommand_add(name, command)
+
+        elif method == "runcommand_remove":
+            key = params.get("key")
+            if not key or not isinstance(key, str):
+                raise ValueError("Parameter 'key' is required and must be a string")
+            return await self.runcommand_remove(key)
+
+        elif method in ("runcommand_exec", "execute_local_command"):
+            key = params.get("key")
+            if not key or not isinstance(key, str):
+                raise ValueError("Parameter 'key' is required and must be a string")
+            return await self.runcommand_exec(key)
+
+        elif method == "runcommand_stop":
+            pid = params.get("id")
+            return await self.runcommand_stop(pid)
+
         elif method in ("stop_daemon", "stop"):
+
             self._spawn_background_task(self.stop(), name="ipc_stop_daemon")
             return {
                 "success": True,

@@ -113,10 +113,16 @@ from pengulink.core.exceptions import (
     CommandNotFoundError,
     MprisError,
     MprisPlayerNotFoundError,
+    PauseMusicError,
     RemoteCommandError,
     RemoteCommandNotFoundError,
     RunCommandError,
+    TelephonyError,
 )
+from pengulink.plugins.pausemusic import PauseMusicPlugin
+from pengulink.plugins.telephony import TelephonyPlugin
+from pengulink.services.pausemusic import PauseMusicConfig, PauseMusicService
+from pengulink.services.telephony import ActiveCall, CallState, TelephonyService
 
 
 
@@ -260,6 +266,9 @@ class PenguLinkDaemon:
         audio_backend: Optional[AudioSinkBackend] = None,
         command_store: Optional[CommandStore] = None,
         command_service: Optional[LocalCommandService] = None,
+        telephony_service: TelephonyService | None = None,
+        pause_music_config: PauseMusicConfig | None = None,
+        pause_music_service: PauseMusicService | None = None,
         **kwargs: Any,
     ) -> None:
 
@@ -400,6 +409,50 @@ class PenguLinkDaemon:
             is_paired_checker=self.is_device_paired,
         )
         self.plugin_registry.register(self.remote_system_volume_plugin)
+
+        # Telephony Plugin & Core Service (Milestones 27 & 29)
+        self.telephony_service = (
+            telephony_service
+            or kwargs.get("telephony_service")
+            or TelephonyService(event_bus=self.event_bus)
+        )
+        self.telephony_plugin = TelephonyPlugin(
+            event_bus=self.event_bus,
+            telephony_service=self.telephony_service,
+            packet_sender=self._send_telephony_packet,
+            is_paired_checker=self.is_device_paired,
+        )
+        self.plugin_registry.register(self.telephony_plugin)
+
+        # PauseMusic Plugin & Media Service (Milestones 28 & 29)
+        self.pause_music_config = (
+            pause_music_config
+            or kwargs.get("pause_music_config")
+            or PauseMusicConfig()
+        )
+        mpris_adapter_instance = (
+            mpris_adapter
+            or kwargs.get("mpris_adapter")
+            or (self.mpris_control.adapter if hasattr(self, "mpris_control") else detect_mpris_adapter())
+        )
+        self.mpris_adapter = mpris_adapter_instance
+        self.pause_music_service = (
+            pause_music_service
+            or kwargs.get("pause_music_service")
+            or PauseMusicService(
+                config=self.pause_music_config,
+                mpris_adapter=mpris_adapter_instance,
+                audio_service=self.audio_service,
+                event_bus=self.event_bus,
+            )
+        )
+        self.pause_music_plugin = PauseMusicPlugin(
+            event_bus=self.event_bus,
+            service=self.pause_music_service,
+        )
+        self.pausemusic_service = self.pause_music_service
+        self.pausemusic_plugin = self.pause_music_plugin
+        self.plugin_registry.register(self.pause_music_plugin)
 
         if hasattr(self.config, "device"):
             self.config.device.incoming_capabilities = self.plugin_registry.get_all_incoming_capabilities()
@@ -639,6 +692,20 @@ class PenguLinkDaemon:
             await self.alert_service.stop()
         except Exception as exc:
             logger.debug("Error stopping alert service: %s", exc)
+
+        # Stop TelephonyService
+        try:
+            if hasattr(self, "telephony_service") and self.telephony_service:
+                self.telephony_service.close()
+        except Exception as exc:
+            logger.debug("Error closing telephony service: %s", exc)
+
+        # Stop PauseMusicService
+        try:
+            if hasattr(self, "pause_music_service") and self.pause_music_service:
+                await self.pause_music_service.stop()
+        except Exception as exc:
+            logger.debug("Error stopping pause music service: %s", exc)
 
         # 5. Close all active client connections
         conns = list(self._active_connections.values())
@@ -2275,6 +2342,131 @@ class PenguLinkDaemon:
         return {"success": True}
 
     # =====================================================================
+    # Telephony Operations (Milestones 27 & 29)
+    # =====================================================================
+
+    def _send_telephony_packet(self, arg1: Any, arg2: Any | None = None) -> None:
+        """Transmit Telephony packet over active TCP connection."""
+        if isinstance(arg1, Packet):
+            packet = arg1
+            device_id = arg2
+        else:
+            device_id = arg1
+            packet = arg2
+        if not device_id or not packet:
+            return
+        self.send_packet(device_id, packet)
+
+    async def telephony_get_calls(self, device_id: str | None = None) -> list[dict[str, Any]]:
+        """Retrieve list of active phone calls."""
+        if not hasattr(self, "telephony_service") or self.telephony_service is None:
+            raise TelephonyError("Telephony service is not available on this daemon")
+        clean_id = device_id.strip() if isinstance(device_id, str) and device_id.strip() else None
+        calls = self.telephony_service.get_active_calls(clean_id)
+        if inspect.isawaitable(calls):
+            calls = await calls
+        return [c.to_dict() if hasattr(c, "to_dict") else dict(c) for c in calls]
+
+    telephony_calls = telephony_get_calls
+
+    async def telephony_mute_ringer(self, device_id: str) -> dict[str, Any]:
+        """Request remote device to silence ringer during incoming call."""
+        if not device_id or not isinstance(device_id, str) or not device_id.strip():
+            raise ValueError("Parameter 'device_id' is required and must be a non-empty string")
+        clean_id = device_id.strip()
+        if not hasattr(self, "telephony_plugin") or self.telephony_plugin is None:
+            raise TelephonyError("Telephony plugin is not registered on this daemon")
+        if not self.is_device_connected(clean_id):
+            raise ConnectionClosedError(f"Device '{clean_id}' is not connected")
+        conn = self._active_connections.get(clean_id)
+        send_cb = (lambda pkt: conn.write_line(PacketEngine.serialize(pkt))) if conn else None
+        await self.telephony_plugin.mute_ringer(clean_id, send_packet=send_cb)
+        return {
+            "device_id": clean_id,
+            "status": "success",
+            "success": True,
+            "muted": True,
+            "action": "muteRinger",
+        }
+
+    async def telephony_reject_call(
+        self, device_id: str, phone_number: str | None = None
+    ) -> dict[str, Any]:
+        """Request remote device to reject or decline an incoming call."""
+        if not device_id or not isinstance(device_id, str) or not device_id.strip():
+            raise ValueError("Parameter 'device_id' is required and must be a non-empty string")
+        clean_id = device_id.strip()
+        if not hasattr(self, "telephony_plugin") or self.telephony_plugin is None:
+            raise TelephonyError("Telephony plugin is not registered on this daemon")
+        if not self.is_device_connected(clean_id):
+            raise ConnectionClosedError(f"Device '{clean_id}' is not connected")
+        conn = self._active_connections.get(clean_id)
+        send_cb = (lambda pkt: conn.write_line(PacketEngine.serialize(pkt))) if conn else None
+        await self.telephony_plugin.reject_call(clean_id, send_packet=send_cb, phone_number=phone_number)
+        return {
+            "device_id": clean_id,
+            "status": "success",
+            "success": True,
+            "rejected": True,
+            "action": "rejectCall",
+        }
+
+    # =====================================================================
+    # PauseMusic Operations (Milestones 28 & 29)
+    # =====================================================================
+
+    async def pausemusic_get_config(self) -> dict[str, Any]:
+        """Retrieve current PauseMusic policy configuration and status."""
+        if not hasattr(self, "pause_music_service") or self.pause_music_service is None:
+            raise PauseMusicError("PauseMusic service is not registered on this daemon")
+        status = self.pause_music_service.get_status()
+        cfg_dict = self.pause_music_service.config.to_dict()
+        result: dict[str, Any] = dict(cfg_dict)
+        result.update({
+            "is_interrupted": status.get("is_interrupted", False),
+            "active_call_devices": status.get("active_call_devices", []),
+            "paused_players": status.get("paused_players", []),
+            "muted_sinks": status.get("muted_sinks", []),
+            "config": cfg_dict,
+        })
+        return result
+
+    pausemusic_status = pausemusic_get_config
+
+    async def pausemusic_set_config(
+        self,
+        condition: str | None = None,
+        action: str | None = None,
+        resume: bool | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Update PauseMusic policy configuration."""
+        if not hasattr(self, "pause_music_service") or self.pause_music_service is None:
+            raise PauseMusicError("PauseMusic service is not registered on this daemon")
+        updates: dict[str, Any] = {}
+        if condition is not None:
+            updates["condition"] = condition
+        if action is not None:
+            updates["action"] = action
+        if resume is not None:
+            updates["resume"] = resume
+        updates.update(kwargs)
+        updated_config = self.pause_music_service.update_config(**updates)
+        status = self.pause_music_service.get_status()
+        cfg_dict = updated_config.to_dict()
+        result: dict[str, Any] = dict(cfg_dict)
+        result.update({
+            "is_interrupted": status.get("is_interrupted", False),
+            "active_call_devices": status.get("active_call_devices", []),
+            "paused_players": status.get("paused_players", []),
+            "muted_sinks": status.get("muted_sinks", []),
+            "config": cfg_dict,
+        })
+        return result
+
+    pausemusic_configure = pausemusic_set_config
+
+    # =====================================================================
     # JSON-RPC 2.0 Method Dispatcher
     # =====================================================================
 
@@ -2846,6 +3038,38 @@ class PenguLinkDaemon:
             pid = params.get("id")
             return await self.runcommand_stop(pid)
 
+        # =================================================================
+        # Telephony Routes (Milestone 29)
+        # =================================================================
+        elif method in ("telephony_get_calls", "telephony_calls", "get_active_calls"):
+            device_id = params.get("device_id")
+            if device_id is not None and not isinstance(device_id, str):
+                raise ValueError("Parameter 'device_id' must be a string")
+            clean_did = device_id.strip() if device_id else None
+            return await self.telephony_get_calls(device_id=clean_did)
+
+        elif method in ("telephony_mute_ringer", "mute_ringer"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str) or not did.strip():
+                raise ValueError("Parameter 'device_id' is required and must be a non-empty string")
+            return await self.telephony_mute_ringer(device_id=did.strip())
+
+        elif method in ("telephony_reject_call", "reject_call"):
+            did = params.get("device_id")
+            if not did or not isinstance(did, str) or not did.strip():
+                raise ValueError("Parameter 'device_id' is required and must be a non-empty string")
+            phone_num = params.get("phone_number")
+            return await self.telephony_reject_call(device_id=did.strip(), phone_number=phone_num)
+
+        # =================================================================
+        # PauseMusic Routes (Milestone 29)
+        # =================================================================
+        elif method in ("pausemusic_get_config", "pausemusic_status", "get_pausemusic_config"):
+            return await self.pausemusic_get_config()
+
+        elif method in ("pausemusic_set_config", "pausemusic_configure", "set_pausemusic_config"):
+            return await self.pausemusic_set_config(**params)
+
         elif method in ("stop_daemon", "stop"):
 
             self._spawn_background_task(self.stop(), name="ipc_stop_daemon")
@@ -2861,17 +3085,18 @@ class PenguLinkDaemon:
 Service = PenguLinkDaemon
 
 __all__ = [
-    "format_uptime",
+    "ClipboardResult",
     "LogRingBuffer",
     "PenguLinkDaemon",
     "Service",
+    "format_uptime",
     "safe_redact_clipboard",
-    "ClipboardResult",
 ]
 
 
 if __name__ == "__main__":
     import sys
+
     from pengulink.cli.main import cli
 
     # Translate direct module invocation into standard CLI daemon run

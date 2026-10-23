@@ -553,12 +553,47 @@ class RemoteAudioSinkListEvent(Event):
     sinks: list[Any] = field(default_factory=list)
 
 
+# =====================================================================
+# Telephony Events (Milestone 27)
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class CallEvent(Event):
+    """Emitted when an incoming telephony event packet is received from a paired device."""
+
+    device_id: str = ""
+    event_type: str = ""  # "ringing", "talking", "missedCall", "idle", "callEnded"
+    phone_number: str = ""
+    contact_name: str = ""
+    is_cancel: bool = False
+    phone_thumbnail: str | None = None
+
+    @property
+    def event(self) -> str:
+        """Alias for event_type for compatibility."""
+        return self.event_type
+
+
+@dataclass(frozen=True)
+class CallStateChangedEvent(Event):
+    """Emitted when active call state changes for a device."""
+
+    device_id: str = ""
+    old_state: str = "IDLE"  # "IDLE", "RINGING", "TALKING", "MISSED"
+    new_state: str = "IDLE"
+    phone_number: str = ""
+    contact_name: str = ""
+
+
 __all__ = [
     "AlertStopped",
     "AlertTriggered",
     "AudioSinkListEvent",
     "AudioSinkUpdatedEvent",
     "BatteryUpdated",
+    "CallEvent",
+    "CallStateChangedEvent",
     "ClipboardUpdatedEvent",
     "CommandExecutedEvent",
     "CommandOutputEvent",
@@ -596,3 +631,4 @@ __all__ = [
     "ShareReceived",
     "ShareReceivedEvent",
 ]
+

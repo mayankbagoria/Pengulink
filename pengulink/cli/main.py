@@ -9,6 +9,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import signal
 import sys
 import time
@@ -111,6 +112,42 @@ def format_network_badge(network_type: str) -> str:
     return f"[dim]{network_type}[/]"
 
 
+def format_call_state_badge(state: str) -> str:
+    """Format a Telephony CallState string into a colored Rich badge."""
+    state_upper = (state or "").upper()
+    badges = {
+        "RINGING": "[bold yellow]🔔 RINGING[/]",
+        "TALKING": "[bold green]📞 TALKING[/]",
+        "MISSED": "[bold red]✕ MISSED[/]",
+        "IDLE": "[dim]○ IDLE[/]",
+    }
+    return badges.get(state_upper, f"[white]{escape(state)}[/]")
+
+
+def format_call_duration(duration_seconds: float | int | None) -> str:
+    """Format call duration in seconds to standard MM:SS or HH:MM:SS format safely."""
+    if duration_seconds is None:
+        return "00:00"
+    try:
+        val = float(duration_seconds)
+    except (TypeError, ValueError):
+        return "00:00"
+
+    if math.isnan(val) or math.isinf(val) or not math.isfinite(val) or val <= 0.0:
+        return "00:00"
+
+    try:
+        total_seconds = int(val)
+    except (ValueError, OverflowError):
+        return "00:00"
+
+    mins, secs = divmod(total_seconds, 60)
+    hours, mins = divmod(mins, 60)
+    if hours > 0:
+        return f"{hours:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
 # =====================================================================
 # IPC Invocation & Error Handling Bridge
 # =====================================================================
@@ -133,6 +170,25 @@ def resolve_socket_path(ctx: click.Context) -> Path:
         return ipc_resolve_socket_path()
 
 
+def is_json_requested(ctx: Optional[click.Context]) -> bool:
+    """Determine whether machine-readable JSON output was requested via root or subcommand flags."""
+    curr = ctx
+    while curr is not None:
+        if curr.obj and isinstance(curr.obj, dict) and curr.obj.get("json_output"):
+            return True
+        if hasattr(curr, "params") and isinstance(curr.params, dict):
+            if (
+                curr.params.get("json_flag")
+                or curr.params.get("json_output")
+                or curr.params.get("json")
+            ):
+                return True
+        curr = curr.parent
+    if any(arg in sys.argv for arg in ("--json", "--json-output")):
+        return True
+    return False
+
+
 def run_ipc_call(
     ctx: click.Context,
     method: str,
@@ -145,16 +201,57 @@ def run_ipc_call(
 
     try:
         return client.call_sync(method=method, params=params, timeout=timeout)
-    except DaemonNotRunningError:
-        console.print(
-            "PenguLink daemon is not running. Start with 'pengulink daemon run' or start the background service."
-        )
+    except DaemonNotRunningError as exc:
+        if is_json_requested(ctx):
+            click.echo(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "code": getattr(exc, "code", -1),
+                        "success": False,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print(
+                "PenguLink daemon is not running. Start with 'pengulink daemon run' or start the background service."
+            )
         sys.exit(1)
     except IPCError as exc:
-        console.print(f"[bold red]IPC Error:[/] {exc}")
+        if is_json_requested(ctx):
+            err_code = getattr(exc, "code", None)
+            if err_code is None and hasattr(exc, "context") and isinstance(exc.context, dict):
+                err_code = exc.context.get("code")
+            if err_code is None:
+                err_code = -1
+            click.echo(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "code": err_code,
+                        "success": False,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print(f"[bold red]IPC Error:[/] {exc}")
         sys.exit(1)
     except Exception as exc:
-        console.print(f"[bold red]Unexpected Error:[/] {exc}")
+        if is_json_requested(ctx):
+            click.echo(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "code": getattr(exc, "code", -1),
+                        "success": False,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print(f"[bold red]Unexpected Error:[/] {exc}")
         sys.exit(1)
 
 
@@ -477,16 +574,57 @@ def connect(
     with console.status(f"[bold cyan]Connecting to device '{device_id}'...[/]"):
         try:
             result = client.call_sync("connect", payload)
-        except DaemonNotRunningError:
-            console.print(
-                "PenguLink daemon is not running. Start with 'pengulink daemon run' or start the background service."
-            )
+        except DaemonNotRunningError as exc:
+            if is_json_requested(ctx):
+                click.echo(
+                    json.dumps(
+                        {
+                            "error": str(exc),
+                            "code": getattr(exc, "code", -1),
+                            "success": False,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                console.print(
+                    "PenguLink daemon is not running. Start with 'pengulink daemon run' or start the background service."
+                )
             sys.exit(1)
         except IPCError as exc:
-            console.print(f"[bold red]IPC Error:[/] {exc}")
+            if is_json_requested(ctx):
+                err_code = getattr(exc, "code", None)
+                if err_code is None and hasattr(exc, "context") and isinstance(exc.context, dict):
+                    err_code = exc.context.get("code")
+                if err_code is None:
+                    err_code = -1
+                click.echo(
+                    json.dumps(
+                        {
+                            "error": str(exc),
+                            "code": err_code,
+                            "success": False,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                console.print(f"[bold red]IPC Error:[/] {exc}")
             sys.exit(1)
         except Exception as exc:
-            console.print(f"[bold red]Unexpected Error:[/] {exc}")
+            if is_json_requested(ctx):
+                click.echo(
+                    json.dumps(
+                        {
+                            "error": str(exc),
+                            "code": getattr(exc, "code", -1),
+                            "success": False,
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                console.print(f"[bold red]Unexpected Error:[/] {exc}")
             sys.exit(1)
 
     if ctx.obj.get("json_output"):
@@ -762,11 +900,23 @@ def daemon_status(ctx: click.Context) -> None:
 
     try:
         status_info = client.call_sync("status", timeout=3.0)
-    except (DaemonNotRunningError, IPCError, Exception):
-        console.print("[bold red]Status:[/] [bold red]● STOPPED (Inactive)[/]")
-        console.print(
-            "PenguLink daemon is not running. Start with 'pengulink daemon run' or start the background service."
-        )
+    except (DaemonNotRunningError, IPCError, Exception) as exc:
+        if is_json_requested(ctx):
+            click.echo(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "code": getattr(exc, "code", -1),
+                        "success": False,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print("[bold red]Status:[/] [bold red]● STOPPED (Inactive)[/]")
+            console.print(
+                "PenguLink daemon is not running. Start with 'pengulink daemon run' or start the background service."
+            )
         sys.exit(1)
 
     if ctx.obj.get("json_output"):
@@ -801,11 +951,35 @@ def daemon_stop(ctx: click.Context) -> None:
     client = PenguLinkIPCClient(socket_path=socket_path)
     try:
         res = client.call_sync("stop_daemon")
-    except (DaemonNotRunningError, FileNotFoundError, ConnectionRefusedError):
-        console.print("[yellow]PenguLink daemon is not running.[/]")
+    except (DaemonNotRunningError, FileNotFoundError, ConnectionRefusedError) as exc:
+        if is_json_requested(ctx):
+            click.echo(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "code": -1,
+                        "success": False,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print("[yellow]PenguLink daemon is not running.[/]")
         sys.exit(1)
     except Exception as exc:
-        console.print(f"[bold red]Failed to stop daemon:[/] {exc}")
+        if is_json_requested(ctx):
+            click.echo(
+                json.dumps(
+                    {
+                        "error": str(exc),
+                        "code": getattr(exc, "code", -1),
+                        "success": False,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print(f"[bold red]Failed to stop daemon:[/] {exc}")
         sys.exit(1)
 
     if ctx.obj.get("json_output"):
@@ -2456,6 +2630,312 @@ def runcommand_run_cmd(ctx: click.Context, key: str, json_flag: bool) -> None:
         console.print("[bold red]Standard Error:[/]")
         for line in stderr_lines:
             console.print(f"  [red]{escape(line.rstrip())}[/]")
+
+
+# =====================================================================
+# Telephony Commands (Milestone 29)
+# =====================================================================
+
+@cli.group(name="telephony", help="Manage and inspect telephony call states and actions.")
+def telephony_group() -> None:
+    """Manage and inspect telephony call states and actions."""
+
+
+@telephony_group.command(name="calls", help="Display active phone calls.")
+@click.argument("device_id_arg", required=False, default=None, metavar="[DEVICE_ID]")
+@click.option(
+    "--device-id",
+    "-d",
+    "device_id_opt",
+    default=None,
+    help="Filter active calls by remote device ID.",
+)
+@click.option(
+    "--json",
+    "json_flag",
+    is_flag=True,
+    default=False,
+    help="Output machine-readable JSON.",
+)
+@click.pass_context
+def telephony_calls_cmd(
+    ctx: click.Context,
+    device_id_arg: str | None,
+    device_id_opt: str | None,
+    json_flag: bool,
+) -> None:
+    """Display active phone calls across devices or filtered by device ID."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    device_id = device_id_opt or device_id_arg
+    if device_id:
+        device_id = device_id.strip()
+
+    params: dict[str, Any] = {}
+    if device_id:
+        params["device_id"] = device_id
+
+    res = run_ipc_call(ctx, "telephony_get_calls", params)
+    calls = res if isinstance(res, list) else []
+
+    if is_json:
+        click.echo(json.dumps(calls, indent=2))
+        return
+
+    if not calls:
+        if device_id:
+            console.print(f"[yellow]No active calls for device '[bold cyan]{escape(device_id)}[/]'.[/]")
+        else:
+            console.print("[yellow]No active phone calls.[/]")
+        return
+
+    title = f"Active Phone Calls ({escape(device_id)})" if device_id else "Active Phone Calls"
+    table = Table(title=title, box=box.ROUNDED, header_style="bold cyan")
+    table.add_column("Device ID", style="cyan", no_wrap=True)
+    table.add_column("Phone Number", style="bold white")
+    table.add_column("Contact Name", style="bold green")
+    table.add_column("State", justify="center")
+    table.add_column("Duration", justify="right")
+
+    for call in calls:
+        d_id = escape(str(call.get("device_id", "")))
+        num = escape(str(call.get("phone_number", "") or "Private/Unknown"))
+        name = escape(str(call.get("contact_name", "") or "Unknown"))
+        st = format_call_state_badge(str(call.get("state", "")))
+        dur = format_call_duration(call.get("duration"))
+        table.add_row(d_id, num, name, st, dur)
+
+    console.print(table)
+
+
+@telephony_group.command(name="mute-ringer", help="Request remote device to mute its incoming call ringer.")
+@click.argument("device_id", type=str)
+@click.option(
+    "--json",
+    "json_flag",
+    is_flag=True,
+    default=False,
+    help="Output machine-readable JSON.",
+)
+@click.pass_context
+def telephony_mute_ringer_cmd(ctx: click.Context, device_id: str, json_flag: bool) -> None:
+    """Send request to mute incoming call ringer on remote device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    clean_did = device_id.strip() if device_id else ""
+    if not clean_did:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    params = {"device_id": clean_did}
+    res = run_ipc_call(ctx, "telephony_mute_ringer", params)
+
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    console.print(f"[bold green]✓[/] Requested ringer mute for device '[bold cyan]{escape(clean_did)}[/]'.")
+
+
+@telephony_group.command(name="reject-call", help="Request remote device to reject the active or incoming call.")
+@click.argument("device_id", type=str)
+@click.option("--phone-number", type=str, default=None, help="Optional phone number to decline.")
+@click.option(
+    "--json",
+    "json_flag",
+    is_flag=True,
+    default=False,
+    help="Output machine-readable JSON.",
+)
+@click.pass_context
+def telephony_reject_call_cmd(
+    ctx: click.Context,
+    device_id: str,
+    phone_number: str | None,
+    json_flag: bool,
+) -> None:
+    """Send request to reject active/incoming call on remote device."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    clean_did = device_id.strip() if device_id else ""
+    if not clean_did:
+        raise click.UsageError("Argument 'DEVICE_ID' must not be empty.")
+
+    params: dict[str, Any] = {"device_id": clean_did}
+    if phone_number:
+        params["phone_number"] = phone_number.strip()
+    res = run_ipc_call(ctx, "telephony_reject_call", params)
+
+    if is_json:
+        click.echo(json.dumps(res, indent=2))
+        return
+
+    console.print(f"[bold green]✓[/] Requested call rejection for device '[bold cyan]{escape(clean_did)}[/]'.")
+
+
+# =====================================================================
+# PauseMusic Commands (Milestone 29)
+# =====================================================================
+
+@cli.group(name="pausemusic", help="Inspect and configure media pause policies on phone calls.")
+def pausemusic_group() -> None:
+    """Manage automatic media pause and audio mute behavior during calls."""
+
+
+@pausemusic_group.command(name="status", help="Display current PauseMusic configuration and interruption state.")
+@click.option(
+    "--json",
+    "json_flag",
+    is_flag=True,
+    default=False,
+    help="Output machine-readable JSON.",
+)
+@click.pass_context
+def pausemusic_status_cmd(ctx: click.Context, json_flag: bool) -> None:
+    """Display PauseMusic configuration and live media interruption state."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+    status_info = run_ipc_call(ctx, "pausemusic_get_config", {})
+
+    cfg = status_info.get("config", {}) if isinstance(status_info, dict) else {}
+    output_dict: dict[str, Any] = dict(status_info) if isinstance(status_info, dict) else {}
+    if isinstance(cfg, dict):
+        output_dict.update(cfg)
+
+    if is_json:
+        click.echo(json.dumps(output_dict, indent=2))
+        return
+
+    cond = output_dict.get("condition", "ringing")
+    cond_talking = output_dict.get("condition_talking", cond == "talking")
+    cond_str = "[cyan]talking[/] (pause after call is answered)" if cond_talking else "[cyan]ringing[/] (pause immediately on incoming ring)"
+
+    act = output_dict.get("action", "pause")
+    action_pause = output_dict.get("action_pause", act in ("pause", "both"))
+    action_mute = output_dict.get("action_mute", act in ("mute", "both"))
+    action_resume = output_dict.get("action_resume", output_dict.get("resume", True))
+
+    pause_badge = "[bold green]Enabled[/]" if action_pause else "[dim]Disabled[/]"
+    mute_badge = "[bold green]Enabled[/]" if action_mute else "[dim]Disabled[/]"
+    resume_badge = "[bold green]Enabled[/]" if action_resume else "[dim]Disabled[/]"
+
+    is_interrupted = output_dict.get("is_interrupted", False)
+    interrupted_badge = "[bold yellow]● ACTIVE INTERRUPTION[/]" if is_interrupted else "[bold green]○ Idle / Normal[/]"
+
+    active_devs = output_dict.get("active_call_devices", [])
+    devs_str = ", ".join(f"[cyan]{escape(d)}[/]" for d in active_devs) if active_devs else "[dim]None[/]"
+
+    paused_plyrs = output_dict.get("paused_players", [])
+    plyrs_str = ", ".join(f"[magenta]{escape(p)}[/]" for p in paused_plyrs) if paused_plyrs else "[dim]None[/]"
+
+    muted_snks = output_dict.get("muted_sinks", [])
+    snks_str = ", ".join(f"[yellow]{escape(s)}[/]" for s in muted_snks) if muted_snks else "[dim]None[/]"
+
+    body = (
+        f"[bold]Trigger Condition:[/]  {cond_str}\n"
+        f"[bold]Action Policy:[/]      [bold cyan]{act}[/] (MPRIS: {pause_badge}, Audio Sinks: {mute_badge})\n"
+        f"[bold]Auto-Resume:[/]        {resume_badge}\n"
+        f"[dim]──────────────────────────────────────────────[/]\n"
+        f"[bold]Interruption Status:[/] {interrupted_badge}\n"
+        f"[bold]Active Devices:[/]      {devs_str}\n"
+        f"[bold]Paused Players:[/]      {plyrs_str}\n"
+        f"[bold]Muted Sinks:[/]         {snks_str}"
+    )
+
+    panel = Panel(body, title="[bold cyan]PauseMusic Status & Policy[/]", box=box.ROUNDED, expand=False)
+    console.print(panel)
+
+
+@pausemusic_group.command(name="configure", help="Configure automatic pause/mute policies for calls.")
+@click.option(
+    "--condition-talking",
+    "--condition",
+    "condition",
+    type=click.Choice(["ringing", "talking"], case_sensitive=False),
+    default=None,
+    help="Trigger condition: 'ringing' (pause on ring) or 'talking' (pause on answer).",
+)
+@click.option(
+    "--action",
+    type=click.Choice(["pause", "mute", "both", "none"], case_sensitive=False),
+    default=None,
+    help="Interruption action: 'pause', 'mute', 'both', or 'none'.",
+)
+@click.option(
+    "--action-pause/--no-action-pause",
+    "action_pause",
+    default=None,
+    help="Enable or disable MPRIS player pausing.",
+)
+@click.option(
+    "--action-mute/--no-action-mute",
+    "action_mute",
+    default=None,
+    help="Enable or disable audio output sink muting.",
+)
+@click.option(
+    "--action-resume/--no-action-resume",
+    "--resume/--no-resume",
+    "action_resume",
+    default=None,
+    help="Enable or disable automatic media/audio resumption when call ends.",
+)
+@click.option(
+    "--json",
+    "json_flag",
+    is_flag=True,
+    default=False,
+    help="Output machine-readable JSON.",
+)
+@click.pass_context
+def pausemusic_configure_cmd(
+    ctx: click.Context,
+    condition: str | None,
+    action: str | None,
+    action_pause: bool | None,
+    action_mute: bool | None,
+    action_resume: bool | None,
+    json_flag: bool,
+) -> None:
+    """Update PauseMusic policy configuration."""
+    is_json = json_flag or (bool(ctx.obj and ctx.obj.get("json_output")))
+
+    if (
+        condition is None
+        and action is None
+        and action_pause is None
+        and action_mute is None
+        and action_resume is None
+    ):
+        raise click.UsageError(
+            "At least one configuration option must be specified (e.g. '--condition', '--action', '--action-pause')."
+        )
+
+    params: dict[str, Any] = {}
+    if condition is not None:
+        params["condition"] = condition.lower()
+    if action is not None:
+        params["action"] = action.lower()
+    if action_pause is not None:
+        params["action_pause"] = action_pause
+    if action_mute is not None:
+        params["action_mute"] = action_mute
+    if action_resume is not None:
+        params["action_resume"] = action_resume
+        params["resume"] = action_resume
+
+    res = run_ipc_call(ctx, "pausemusic_set_config", params)
+
+    cfg = res.get("config", {}) if isinstance(res, dict) else {}
+    output_dict: dict[str, Any] = dict(res) if isinstance(res, dict) else {}
+    if isinstance(cfg, dict):
+        output_dict.update(cfg)
+
+    if is_json:
+        click.echo(json.dumps(output_dict, indent=2))
+        return
+
+    console.print("[bold green]✓[/] Updated PauseMusic configuration:")
+    console.print(f"  [bold]Condition:[/] [cyan]{output_dict.get('condition')}[/]")
+    console.print(
+        f"  [bold]Action:[/]    [cyan]{output_dict.get('action')}[/] (pause={output_dict.get('action_pause')}, mute={output_dict.get('action_mute')})"
+    )
+    console.print(f"  [bold]Resume:[/]    [cyan]{output_dict.get('action_resume', output_dict.get('resume'))}[/]")
 
 
 if __name__ == "__main__":

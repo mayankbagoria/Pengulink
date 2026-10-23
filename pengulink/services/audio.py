@@ -684,6 +684,28 @@ def detect_audio_backend(preferred_backend: str | None = None) -> AudioSinkBacke
 detect_audio_sink_backend = detect_audio_backend
 
 
+class AwaitableSinkList(list):
+    """A list of AudioSink items that can be both iterated synchronously and awaited asynchronously."""
+
+    def __init__(
+        self,
+        initial_items: list[AudioSink] | None = None,
+        async_func: Any | None = None,
+    ) -> None:
+        super().__init__(initial_items or [])
+        self._async_func = async_func
+
+    def __await__(self):
+        async def _resolve():
+            if self._async_func is not None:
+                res = await self._async_func()
+                self.clear()
+                self.extend(res)
+            return self
+
+        return _resolve().__await__()
+
+
 class LocalAudioService:
     """High-level, thread/asyncio-safe local audio controller service."""
 
@@ -695,9 +717,27 @@ class LocalAudioService:
         self.backend = backend or detect_audio_backend()
         self.event_bus = event_bus
         self._lock = asyncio.Lock()
+        self._cached_sinks: list[AudioSink] = []
+
+    def _get_sync_sinks(self) -> list[AudioSink]:
+        if hasattr(self.backend, "_sinks") and isinstance(self.backend._sinks, dict):
+            return [
+                AudioSink(
+                    name=s.name,
+                    description=s.description,
+                    volume=s.volume,
+                    max_volume=s.max_volume,
+                    muted=s.muted,
+                    enabled=s.enabled,
+                )
+                for s in self.backend._sinks.values()
+            ]
+        return list(self._cached_sinks)
 
     async def _list_sinks_unlocked(self) -> list[AudioSink]:
-        return await self.backend.list_sinks()
+        sinks = await self.backend.list_sinks()
+        self._cached_sinks = list(sinks)
+        return sinks
 
     async def _get_sink_unlocked(self, name: str) -> AudioSink | None:
         sinks = await self._list_sinks_unlocked()
@@ -710,10 +750,16 @@ class LocalAudioService:
         """Check if underlying backend is responsive."""
         return await self.backend.is_available()
 
-    async def list_sinks(self) -> list[AudioSink]:
-        """List all audio output sinks concurrency-safely."""
-        async with self._lock:
-            return await self._list_sinks_unlocked()
+    def list_sinks(self) -> Any:
+        """List all audio output sinks concurrency-safely. Supports both await and synchronous iteration."""
+        async def _async_runner() -> list[AudioSink]:
+            async with self._lock:
+                return await self._list_sinks_unlocked()
+
+        return AwaitableSinkList(
+            initial_items=self._get_sync_sinks(),
+            async_func=_async_runner,
+        )
 
     async def get_sink(self, name: str) -> AudioSink | None:
         """Retrieve a specific sink by name or node ID."""
@@ -785,6 +831,7 @@ __all__ = [
     "AudioSink",
     "AudioSinkBackend",
     "AudioUnavailableError",
+    "AwaitableSinkList",
     "LocalAudioService",
     "MockAudioSinkBackend",
     "PipeWireAudioBackend",

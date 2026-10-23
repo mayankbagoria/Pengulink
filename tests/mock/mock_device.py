@@ -107,6 +107,11 @@ class MockDeviceConfig:
             # SystemVolume & RemoteSystemVolume Capabilities
             "kdeconnect.systemvolume",
             "kdeconnect.systemvolume.request",
+            # Telephony & PauseMusic Capabilities
+            "kdeconnect.telephony",
+            "kdeconnect.telephony.request_mute",
+            "kdeconnect.telephony.request",
+            "kdeconnect.pausemusic",
         ]
     )
     outgoing_capabilities: list[str] = field(
@@ -142,6 +147,11 @@ class MockDeviceConfig:
             # SystemVolume & RemoteSystemVolume Capabilities
             "kdeconnect.systemvolume",
             "kdeconnect.systemvolume.request",
+            # Telephony & PauseMusic Capabilities
+            "kdeconnect.telephony",
+            "kdeconnect.telephony.request_mute",
+            "kdeconnect.telephony.request",
+            "kdeconnect.pausemusic",
         ]
     )
 
@@ -317,6 +327,10 @@ class MockKdeConnectDevice:
         }
         self._systemvolume_requests: List[Packet] = []
         self._systemvolume_announcements: List[Packet] = []
+
+        # Telephony Simulation State
+        self._telephony_actions: List[Packet] = []
+        self._last_telephony_call: Optional[Dict[str, Any]] = None
 
 
     @property
@@ -1055,6 +1069,15 @@ class MockKdeConnectDevice:
 
         elif packet.type == "kdeconnect.systemvolume":
             self._systemvolume_announcements.append(packet)
+
+        # ------------------------------------------------------------------
+        # 12. Telephony Action Handling
+        # ------------------------------------------------------------------
+        elif packet.type in (
+            "kdeconnect.telephony.request_mute",
+            "kdeconnect.telephony.request",
+        ) or (packet.type == "kdeconnect.telephony" and packet.body and "action" in packet.body):
+            self._telephony_actions.append(packet)
 
 
     # ------------------------------------------------------------------
@@ -2166,7 +2189,137 @@ class MockKdeConnectDevice:
             timeout_seconds=timeout,
         )
 
+    # ------------------------------------------------------------------
+    # Telephony Simulation Helpers
+    # ------------------------------------------------------------------
+    async def send_telephony_call(
+        self,
+        event: str,
+        phone_number: str | None = None,
+        contact_name: str | None = None,
+        phone_thumbnail: str | None = None,
+        is_cancel: bool | str | None = None,
+    ) -> Packet:
+        """Transmit kdeconnect.telephony packet to simulate call event."""
+        body: dict[str, Any] = {"event": event}
+        if phone_number is not None:
+            body["phoneNumber"] = phone_number
+        if contact_name is not None:
+            body["contactName"] = contact_name
+        if phone_thumbnail is not None:
+            body["phoneThumbnail"] = phone_thumbnail
+        if is_cancel is not None:
+            body["isCancel"] = is_cancel
+
+        self._last_telephony_call = dict(body)
+        pkt = Packet(type="kdeconnect.telephony", body=body)
+        await self.send_packet(pkt)
+        return pkt
+
+    async def simulate_incoming_call(
+        self,
+        phone_number: str = "+15551234567",
+        contact_name: str = "Alice",
+        phone_thumbnail: str | None = None,
+    ) -> Packet:
+        """Simulate an incoming ringing phone call."""
+        return await self.send_telephony_call(
+            event="ringing",
+            phone_number=phone_number,
+            contact_name=contact_name,
+            phone_thumbnail=phone_thumbnail,
+            is_cancel=False,
+        )
+
+    async def simulate_answer_call(
+        self,
+        phone_number: str = "+15551234567",
+        contact_name: str = "Alice",
+        phone_thumbnail: str | None = None,
+    ) -> Packet:
+        """Simulate user answering call (call active/talking)."""
+        return await self.send_telephony_call(
+            event="talking",
+            phone_number=phone_number,
+            contact_name=contact_name,
+            phone_thumbnail=phone_thumbnail,
+            is_cancel=False,
+        )
+
+    async def simulate_end_call(
+        self,
+        phone_number: str = "+15551234567",
+        contact_name: str = "Alice",
+    ) -> Packet:
+        """Simulate call ending (cancelling/idle)."""
+        return await self.send_telephony_call(
+            event="idle",
+            phone_number=phone_number,
+            contact_name=contact_name,
+            is_cancel=True,
+        )
+
+    async def simulate_missed_call(
+        self,
+        phone_number: str = "+15551234567",
+        contact_name: str = "Alice",
+    ) -> Packet:
+        """Simulate a missed incoming call."""
+        return await self.send_telephony_call(
+            event="missedCall",
+            phone_number=phone_number,
+            contact_name=contact_name,
+            is_cancel=False,
+        )
+
+    def get_telephony_actions(self, action: str | None = None) -> list[Packet]:
+        """Return history of received telephony action packets."""
+        if action is None:
+            return list(self._telephony_actions)
+        return [
+            p
+            for p in self._telephony_actions
+            if (p.type == "kdeconnect.telephony.request_mute" and action in ("mute", "muteRinger"))
+            or (p.type == "kdeconnect.telephony.request" and p.body.get("action") == action)
+        ]
+
+    async def wait_for_telephony_action(
+        self,
+        action: str | None = None,
+        timeout: float = 5.0,
+    ) -> Packet:
+        """Wait for an outbound action packet from host daemon.
+
+        Args:
+            action: Optional action name filter (e.g. "mute", "muteRinger", "rejectCall").
+            timeout: Maximum seconds to wait.
+        """
+        loop = asyncio.get_running_loop()
+        start_time = loop.time()
+
+        def _matches(p: Packet) -> bool:
+            if action is None:
+                return p.type in ("kdeconnect.telephony.request_mute", "kdeconnect.telephony.request")
+            if action in ("mute", "muteRinger"):
+                if p.type == "kdeconnect.telephony.request_mute":
+                    return True
+                return bool(p.type == "kdeconnect.telephony.request" and p.body.get("action") in ("mute", "muteRinger"))
+            return bool(p.type == "kdeconnect.telephony.request" and p.body.get("action") == action)
+
+        while loop.time() - start_time < timeout:
+            for p in self._telephony_actions:
+                if _matches(p):
+                    return p
+            await asyncio.sleep(0.05)
+
+        raise ConnectionTimeoutError(
+            f"Timed out waiting for telephony action (action={action})",
+            timeout_seconds=timeout,
+        )
+
+
 
 # Convenience Alias
 MockDevice = MockKdeConnectDevice
+
 

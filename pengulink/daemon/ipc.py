@@ -21,6 +21,7 @@ from pengulink.core.exceptions import (
     AlertError,
     AudioBackendError,
     AudioUnavailableError,
+    CallNotFoundError,
     CommandExecutionError,
     CommandNotFoundError,
     ConnectionClosedError,
@@ -30,6 +31,7 @@ from pengulink.core.exceptions import (
     DaemonAlreadyRunningError,
     DaemonNotRunningError,
     DeviceNotFoundError,
+    InvalidCallStateError,
     InvalidStateTransitionError,
     IPCError,
     MprisAdapterError,
@@ -39,6 +41,8 @@ from pengulink.core.exceptions import (
     PairingRejectedError,
     PairingTimestampExpiredError,
     PathTraversalError,
+    PauseMusicConfigError,
+    PauseMusicError,
     PayloadTransferError,
     PenguLinkError,
     RemoteCommandError,
@@ -49,6 +53,7 @@ from pengulink.core.exceptions import (
     StorageError,
     StorageWriteError,
     SyncTimeoutError,
+    TelephonyError,
     TransferError,
 )
 from pengulink.plugins.clipboard.backend import ClipboardError, ClipboardUnavailableError
@@ -84,6 +89,8 @@ MPRIS_ERROR = -32013
 REMOTE_COMMANDS_ERROR = -32014
 AUDIO_SYSTEM_VOLUME_ERROR = -32015
 RUN_COMMAND_ERROR = -32016
+TELEPHONY_ERROR = -32017
+PAUSE_MUSIC_ERROR = -32018
 
 
 
@@ -392,6 +399,10 @@ class PenguLinkIPCServer:
             return self._format_error(req_id if has_id else None, REMOTE_COMMANDS_ERROR, str(exc)) if has_id else b""
         except (RunCommandError, CommandNotFoundError, CommandExecutionError) as exc:
             return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
+        except (TelephonyError, CallNotFoundError, InvalidCallStateError) as exc:
+            return self._format_error(req_id if has_id else None, TELEPHONY_ERROR, str(exc)) if has_id else b""
+        except (PauseMusicError, PauseMusicConfigError) as exc:
+            return self._format_error(req_id if has_id else None, PAUSE_MUSIC_ERROR, str(exc)) if has_id else b""
         except (StorageError, StorageCorruptedError, StorageWriteError) as exc:
             if method.startswith("runcommand_"):
                 return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
@@ -417,6 +428,10 @@ class PenguLinkIPCServer:
         except (ValueError, TypeError) as exc:
             if method.startswith("runcommand_") and ("disabled" in str(exc).lower() or "not found" in str(exc).lower()):
                 return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
+            if method.startswith("pausemusic_") and ("condition" in str(exc).lower() or "action" in str(exc).lower() or "resume" in str(exc).lower()):
+                return self._format_error(req_id if has_id else None, PAUSE_MUSIC_ERROR, str(exc)) if has_id else b""
+            if method.startswith("telephony_") and "call" in str(exc).lower():
+                return self._format_error(req_id if has_id else None, TELEPHONY_ERROR, str(exc)) if has_id else b""
             return self._format_error(req_id if has_id else None, INVALID_PARAMS, f"Invalid parameters: {exc}") if has_id else b""
         except ClipboardUnavailableError as exc:
             return self._format_error(req_id if has_id else None, INTERNAL_ERROR, str(exc)) if has_id else b""
@@ -445,6 +460,10 @@ class PenguLinkIPCServer:
                 code = AUDIO_SYSTEM_VOLUME_ERROR
             elif method.startswith("runcommand_"):
                 code = RUN_COMMAND_ERROR
+            elif method.startswith("telephony_"):
+                code = TELEPHONY_ERROR
+            elif method.startswith("pausemusic_"):
+                code = PAUSE_MUSIC_ERROR
             else:
                 code = APPLICATION_ERROR
             return self._format_error(req_id if has_id else None, code, msg) if has_id else b""
@@ -453,6 +472,10 @@ class PenguLinkIPCServer:
                 return self._format_error(req_id if has_id else None, AUDIO_SYSTEM_VOLUME_ERROR, str(exc)) if has_id else b""
             if method.startswith("runcommand_"):
                 return self._format_error(req_id if has_id else None, RUN_COMMAND_ERROR, str(exc)) if has_id else b""
+            if method.startswith("telephony_"):
+                return self._format_error(req_id if has_id else None, TELEPHONY_ERROR, str(exc)) if has_id else b""
+            if method.startswith("pausemusic_"):
+                return self._format_error(req_id if has_id else None, PAUSE_MUSIC_ERROR, str(exc)) if has_id else b""
             if method == "set_clipboard":
                 logger.warning("Error executing IPC method '%s': %s", method, type(exc).__name__)
             else:
@@ -1101,37 +1124,138 @@ class PenguLinkIPCClient:
     list_local_commands = runcommand_list
     execute_local_command = runcommand_exec
 
+    # =====================================================================
+    # Telephony Methods (Milestone 29)
+    # =====================================================================
+
+    async def telephony_get_calls(
+        self,
+        device_id: str | None = None,
+        timeout: float = 10.0,
+    ) -> list[dict[str, Any]]:
+        """Fetch list of active calls across all devices or filtered by device_id."""
+        params: dict[str, Any] = {}
+        if device_id is not None:
+            params["device_id"] = str(device_id).strip()
+        res = await self.call("telephony_get_calls", params, timeout=timeout)
+        return list(res) if isinstance(res, list) else []
+
+    async def telephony_mute_ringer(
+        self,
+        device_id: str,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Send mute ringer action packet to the specified remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a non-empty string")
+        params: dict[str, Any] = {"device_id": device_id.strip()}
+        res = await self.call("telephony_mute_ringer", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def telephony_reject_call(
+        self,
+        device_id: str,
+        phone_number: str | None = None,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Send reject call action packet to the specified remote device."""
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("Parameter 'device_id' is required and must be a non-empty string")
+        params: dict[str, Any] = {"device_id": device_id.strip()}
+        if phone_number is not None:
+            params["phone_number"] = str(phone_number).strip()
+        res = await self.call("telephony_reject_call", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    # Telephony Client Aliases
+    get_active_calls = telephony_get_calls
+    telephony_calls = telephony_get_calls
+    mute_ringer = telephony_mute_ringer
+    reject_call = telephony_reject_call
+
+    # =====================================================================
+    # PauseMusic Methods (Milestone 29)
+    # =====================================================================
+
+    async def pausemusic_get_config(
+        self,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        """Fetch current PauseMusic configuration and runtime interruption status."""
+        res = await self.call("pausemusic_get_config", {}, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    async def pausemusic_set_config(
+        self,
+        condition: str | None = None,
+        condition_talking: bool | None = None,
+        action: str | None = None,
+        action_pause: bool | None = None,
+        action_mute: bool | None = None,
+        action_resume: bool | None = None,
+        resume: bool | None = None,
+        timeout: float = 10.0,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Update PauseMusic configuration options."""
+        params: dict[str, Any] = {}
+        if condition is not None:
+            params["condition"] = condition
+        if condition_talking is not None:
+            params["condition_talking"] = condition_talking
+        if action is not None:
+            params["action"] = action
+        if action_pause is not None:
+            params["action_pause"] = action_pause
+        if action_mute is not None:
+            params["action_mute"] = action_mute
+        if action_resume is not None:
+            params["action_resume"] = action_resume
+        if resume is not None:
+            params["resume"] = resume
+        params.update(kwargs)
+        res = await self.call("pausemusic_set_config", params, timeout=timeout)
+        return dict(res) if isinstance(res, dict) else {}
+
+    # PauseMusic Client Aliases
+    pausemusic_status = pausemusic_get_config
+    get_pausemusic_config = pausemusic_get_config
+    pausemusic_configure = pausemusic_set_config
+    set_pausemusic_config = pausemusic_set_config
+
 
 # Convenience Alias
 IPCSocketClient = PenguLinkIPCClient
 
 __all__ = [
-    "JSONRPC_VERSION",
-    "STREAM_LIMIT_BYTES",
-    "PARSE_ERROR",
-    "INVALID_REQUEST",
-    "METHOD_NOT_FOUND",
-    "INVALID_PARAMS",
-    "INTERNAL_ERROR",
-    "APPLICATION_ERROR",
-    "DEVICE_NOT_FOUND",
-    "DEVICE_NOT_CONNECTED",
-    "PAIRING_ERROR",
-    "INVALID_STATE_TRANSITION",
-    "NOTIFICATION_NOT_FOUND",
-    "DAEMON_NOT_READY",
-    "OPERATION_TIMEOUT",
-    "DAEMON_ALREADY_RUNNING",
-    "CLIPBOARD_ERROR",
     "ALERT_ERROR",
-    "SHARE_ERROR",
-    "CONTACTS_ERROR",
-    "MPRIS_ERROR",
-    "REMOTE_COMMANDS_ERROR",
+    "APPLICATION_ERROR",
     "AUDIO_SYSTEM_VOLUME_ERROR",
-    "RUN_COMMAND_ERROR",
-    "resolve_socket_path",
-    "PenguLinkIPCServer",
-    "PenguLinkIPCClient",
+    "CLIPBOARD_ERROR",
+    "CONTACTS_ERROR",
+    "DAEMON_ALREADY_RUNNING",
+    "DAEMON_NOT_READY",
+    "DEVICE_NOT_CONNECTED",
+    "DEVICE_NOT_FOUND",
+    "INTERNAL_ERROR",
+    "INVALID_PARAMS",
+    "INVALID_REQUEST",
+    "INVALID_STATE_TRANSITION",
     "IPCSocketClient",
+    "JSONRPC_VERSION",
+    "METHOD_NOT_FOUND",
+    "MPRIS_ERROR",
+    "NOTIFICATION_NOT_FOUND",
+    "OPERATION_TIMEOUT",
+    "PAIRING_ERROR",
+    "PARSE_ERROR",
+    "PAUSE_MUSIC_ERROR",
+    "PenguLinkIPCClient",
+    "PenguLinkIPCServer",
+    "REMOTE_COMMANDS_ERROR",
+    "RUN_COMMAND_ERROR",
+    "SHARE_ERROR",
+    "STREAM_LIMIT_BYTES",
+    "TELEPHONY_ERROR",
+    "resolve_socket_path",
 ]

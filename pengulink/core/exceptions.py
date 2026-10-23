@@ -7,7 +7,7 @@ and daemon IPC.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class PenguLinkError(Exception):
@@ -18,7 +18,7 @@ class PenguLinkError(Exception):
         context: Optional dictionary containing debugging metadata.
     """
 
-    def __init__(self, message: str, context: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, message: str, context: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.context = context or {}
@@ -29,7 +29,7 @@ class PenguLinkError(Exception):
             return f"{self.message} ({ctx_str})"
         return self.message
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize exception details for structured logging or IPC transmission."""
         return {
             "error_type": self.__class__.__name__,
@@ -68,8 +68,8 @@ class PacketParseError(PacketError):
     def __init__(
         self,
         message: str,
-        raw_snippet: Optional[bytes] = None,
-        context: Optional[Dict[str, Any]] = None,
+        raw_snippet: bytes | None = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         ctx = dict(context) if context else {}
         if raw_snippet is not None:
@@ -119,7 +119,7 @@ class LimitOverrunError(FramingError):
         self,
         message: str = "Stream line exceeded buffer guard limit (128 KB) without newline delimiter",
         consumed_bytes: int = 131072,
-        context: Optional[Dict[str, Any]] = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         ctx = dict(context) if context else {}
         ctx["consumed_bytes"] = consumed_bytes
@@ -145,8 +145,8 @@ class PortBindingError(NetworkError):
         self,
         message: str,
         protocol: str = "TCP",
-        port_range: Optional[str] = "1716-1764",
-        context: Optional[Dict[str, Any]] = None,
+        port_range: str | None = "1716-1764",
+        context: dict[str, Any] | None = None,
     ) -> None:
         ctx = dict(context) if context else {}
         ctx["protocol"] = protocol
@@ -160,10 +160,10 @@ class ConnectionTimeoutError(NetworkError):
     def __init__(
         self,
         message: str,
-        timeout_seconds: Optional[float] = None,
-        host: Optional[str] = None,
-        port: Optional[int] = None,
-        context: Optional[Dict[str, Any]] = None,
+        timeout_seconds: float | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         ctx = dict(context) if context else {}
         if timeout_seconds is not None:
@@ -216,9 +216,9 @@ class CertificateVerificationError(CryptoError):
     def __init__(
         self,
         message: str,
-        expected_device_id: Optional[str] = None,
-        presented_cn: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None,
+        expected_device_id: str | None = None,
+        presented_cn: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         ctx = dict(context) if context else {}
         if expected_device_id is not None:
@@ -256,7 +256,7 @@ class InvalidStateTransitionError(StateMachineError):
         device_id: str,
         current_state: str,
         attempted_state: str,
-        context: Optional[Dict[str, Any]] = None,
+        context: dict[str, Any] | None = None,
     ) -> None:
         ctx = dict(context) if context else {}
         ctx["device_id"] = device_id
@@ -491,84 +491,116 @@ class CommandExecutionError(RunCommandError):
     """Raised when execution of a local command fails."""
 
 
-__all__ = [
-    "PenguLinkError",
+# =====================================================================
+# Telephony Exceptions (Milestone 27)
+# =====================================================================
 
-    "ConfigError",
-    "ConfigValidationError",
-    "ConfigNotFoundError",
-    "PacketError",
-    "PacketParseError",
-    "MalformedPacketError",
-    "TruncatedPacketError",
-    "PacketValidationError",
-    "InvalidPacketSchemaError",
-    "UnknownPacketTypeError",
-    "FramingError",
-    "PacketFramingError",
-    "LimitOverrunError",
-    "PacketBufferOverrunError",
-    "NetworkError",
-    "PortBindingError",
-    "ConnectionTimeoutError",
-    "ConnectionClosedError",
-    "ConnectionRejectedError",
-    "InterfaceEnumerationError",
-    "SocketConfigurationError",
-    "CryptoError",
-    "KeyGenerationError",
-    "CertificateError",
-    "CertificateVerificationError",
-    "CertificatePermissionError",
-    "TLSUpgradeError",
-    "TLSHandshakeError",
-    "StateMachineError",
-    "InvalidStateTransitionError",
-    "DeviceNotFoundError",
-    "DeviceAlreadyConnectedError",
-    "PairingError",
-    "PairingRejectedError",
-    "PairingTimeoutError",
-    "AuthenticationCodeMismatchError",
-    "PairingTimestampExpiredError",
-    "StorageError",
-    "StorageCorruptedError",
-    "StorageWriteError",
-    "PluginError",
-    "PluginNotFoundError",
-    "PluginInitializationError",
-    "ContactsError",
-    "ContactNotFoundError",
-    "SyncTimeoutError",
-    "ContactsSyncError",
-    "ContactsTimeoutError",
-    "DaemonError",
-    "IPCError",
-    "DaemonAlreadyRunningError",
-    "DaemonNotRunningError",
+class TelephonyError(PluginError):
+    """Base exception for telephony plugin and call management errors."""
+
+
+class CallNotFoundError(TelephonyError, KeyError):
+    """Raised when an active call cannot be found for a given device ID."""
+
+
+class InvalidCallStateError(TelephonyError):
+    """Raised when an invalid call event or state transition is encountered."""
+
+
+# =====================================================================
+# PauseMusic Exceptions (Milestone 28)
+# =====================================================================
+
+class PauseMusicError(PluginError):
+    """Base exception for PauseMusic plugin and media coordination errors."""
+
+
+class PauseMusicConfigError(PauseMusicError):
+    """Raised when PauseMusic configuration validation fails."""
+
+
+__all__ = [
+    "ActionUnsupportedError",
     "AlertError",
     "AudioBackendError",
     "AudioUnavailableError",
-    "ShareError",
-    "PathTraversalError",
-    "TransferError",
-    "IncompleteTransferError",
-    "PayloadSizeExceededError",
+    "AuthenticationCodeMismatchError",
+    "CallNotFoundError",
+    "CertificateError",
+    "CertificatePermissionError",
+    "CertificateVerificationError",
+    "CommandExecutionError",
+    "CommandNotFoundError",
+    "ConfigError",
+    "ConfigNotFoundError",
+    "ConfigValidationError",
+    "ConnectionClosedError",
+    "ConnectionRejectedError",
+    "ConnectionTimeoutError",
+    "ContactNotFoundError",
+    "ContactsError",
+    "ContactsSyncError",
+    "ContactsTimeoutError",
+    "CryptoError",
+    "DaemonAlreadyRunningError",
+    "DaemonError",
+    "DaemonNotRunningError",
     "DestinationDirectoryError",
-    "PayloadTransferError",
-    "PayloadPortBindingError",
-    "PayloadTimeoutError",
-    "MprisError",
+    "DeviceAlreadyConnectedError",
+    "DeviceNotFoundError",
+    "FramingError",
+    "IPCError",
+    "IncompleteTransferError",
+    "InterfaceEnumerationError",
+    "InvalidCallStateError",
+    "InvalidPacketSchemaError",
+    "InvalidStateTransitionError",
+    "KeyGenerationError",
+    "LimitOverrunError",
+    "MalformedPacketError",
+    "MprisActionError",
     "MprisAdapterError",
     "MprisAdapterUnavailableError",
-    "MprisPlayerNotFoundError",
-    "PlayerNotFoundError",
-    "ActionUnsupportedError",
-    "MprisActionError",
+    "MprisError",
     "MprisPayloadError",
+    "MprisPlayerNotFoundError",
+    "NetworkError",
+    "PacketBufferOverrunError",
+    "PacketError",
+    "PacketFramingError",
+    "PacketParseError",
+    "PacketValidationError",
+    "PairingError",
+    "PairingRejectedError",
+    "PairingTimeoutError",
+    "PairingTimestampExpiredError",
+    "PathTraversalError",
+    "PauseMusicConfigError",
+    "PauseMusicError",
+    "PayloadPortBindingError",
+    "PayloadSizeExceededError",
+    "PayloadTimeoutError",
+    "PayloadTransferError",
+    "PenguLinkError",
+    "PlayerNotFoundError",
+    "PluginError",
+    "PluginInitializationError",
+    "PluginNotFoundError",
+    "PortBindingError",
     "RemoteCommandError",
     "RemoteCommandNotFoundError",
     "RunCommandError",
-    "CommandNotFoundError",
-    "CommandExecutionError",
+    "ShareError",
+    "SocketConfigurationError",
+    "StateMachineError",
+    "StorageCorruptedError",
+    "StorageError",
+    "StorageWriteError",
+    "SyncTimeoutError",
+    "TLSHandshakeError",
+    "TLSUpgradeError",
+    "TelephonyError",
+    "TransferError",
+    "TruncatedPacketError",
+    "UnknownPacketTypeError",
 ]
